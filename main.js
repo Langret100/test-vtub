@@ -310,7 +310,21 @@ function applyGesture(dt) {
   }
 }
 
-const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
+// WebGL2 check: three-vrm MToon shaders use GLSL3 features.
+// If the device/browser falls back to WebGL1, MToon may fail to compile.
+const gl2 = canvas.getContext('webgl2', { antialias: true, alpha: true });
+const supportsWebGL2 = !!gl2;
+if (!supportsWebGL2) {
+  console.warn('[VTuber] WebGL2 not available. Falling back to basic materials (no MToon).');
+  addMessage('bot', '⚠️ 이 기기에서는 WebGL2가 꺼져있거나 지원되지 않아, 간단한 재질로 표시할게.');
+}
+
+const renderer = new THREE.WebGLRenderer({
+  canvas,
+  context: gl2 || undefined,
+  antialias: true,
+  alpha: true,
+});
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 renderer.setSize(canvas.clientWidth, canvas.clientHeight, false);
 renderer.outputColorSpace = THREE.SRGBColorSpace;
@@ -330,6 +344,53 @@ const dir = new THREE.DirectionalLight(0xffffff, 1.1);
 dir.position.set(1.5, 2.5, 2.0);
 scene.add(dir);
 
+function cloneBasicMaterial(src, isSkinned) {
+  // Replace MToon (custom toon shader) with a standard PBR material to keep WebGL1 compatibility.
+  const dst = new THREE.MeshStandardMaterial();
+  if (src.color) dst.color.copy(src.color);
+  if (src.map) dst.map = src.map;
+  if (src.normalMap) dst.normalMap = src.normalMap;
+  if (src.emissive) dst.emissive.copy(src.emissive);
+  if (src.emissiveMap) dst.emissiveMap = src.emissiveMap;
+  if (src.roughness != null) dst.roughness = src.roughness;
+  if (src.metalness != null) dst.metalness = src.metalness;
+
+  // Transparency / cutout
+  dst.transparent = !!src.transparent;
+  dst.opacity = src.opacity != null ? src.opacity : 1;
+  dst.alphaTest = src.alphaTest != null ? src.alphaTest : 0;
+  dst.depthWrite = src.depthWrite != null ? src.depthWrite : true;
+  dst.side = src.side != null ? src.side : THREE.FrontSide;
+
+  // Skinning
+  dst.skinning = !!isSkinned;
+
+  dst.needsUpdate = true;
+  return dst;
+}
+
+function downgradeMaterialsForWebGL1(root) {
+  root.traverse((obj) => {
+    if (!obj.isMesh) return;
+    const isSkinned = !!obj.isSkinnedMesh;
+    const mats = Array.isArray(obj.material) ? obj.material : [obj.material];
+    const newMats = mats.map((m) => {
+      if (!m) return m;
+      // Avoid cloning if it's already a standard material
+      const type = (m.type || '').toLowerCase();
+      if (type.includes('standard') || type.includes('phong') || type.includes('lambert')) {
+        if (isSkinned && m.skinning !== true) {
+          m.skinning = true;
+          m.needsUpdate = true;
+        }
+        return m;
+      }
+      return cloneBasicMaterial(m, isSkinned);
+    });
+    obj.material = Array.isArray(obj.material) ? newMats : newMats[0];
+  });
+}
+
 const loader = new GLTFLoader();
 loader.register((parser) => new VRMLoaderPlugin(parser));
 
@@ -347,6 +408,12 @@ async function loadVrm() {
           scene.remove(currentVrm.scene);
         }
         currentVrm = vrm;
+
+        if (!supportsWebGL2) {
+          // Make the avatar visible on WebGL1 by replacing MToon materials.
+          downgradeMaterialsForWebGL1(vrm.scene);
+        }
+
 
         // Nice default pose/position
         vrm.scene.rotation.y = Math.PI; // face camera
