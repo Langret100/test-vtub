@@ -186,7 +186,8 @@ function onResize(){
   const w = canvas.clientWidth;
   const h = canvas.clientHeight;
   // Android 성능/발열/메모리 이슈를 줄이기 위해 모바일 DPR 상한을 낮춤
-  const dprCap = isMobile() ? 1.05 : 2;
+  // Mobile perf: keep DPR low to reduce memory/bandwidth and prevent "stuck" loads on some Android devices.
+  const dprCap = isMobile() ? 0.95 : 2;
   renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, dprCap));
   renderer.setSize(w, h, false);
   camera.aspect = w / h;
@@ -391,6 +392,7 @@ let avatarRoot = null;
 let bones = {};
 let fallback = null;
 let baseLook = { head: null, neck: null, chest: null };
+let yawOffset = 0; // auto-calibrated so the avatar doesn't "walk backwards"
 
 function toStandardMaterials(obj){
   obj.traverse((n) => {
@@ -498,6 +500,23 @@ async function loadAvatar(){
       avatarRoot.position.set(0.2, 0, -0.25);
       avatarRoot.rotation.y = Math.PI * 0.15;
       scene.add(avatarRoot);
+
+      // Calibrate model forward direction.
+      // Some VRM models face -Z in their local space, which makes movement look like walking backwards.
+      // We compare +Z vs -Z against the camera direction and pick the one that best faces the camera.
+      try{
+        const q = new THREE.Quaternion();
+        avatarRoot.getWorldQuaternion(q);
+        const fwd = new THREE.Vector3(0,0,1).applyQuaternion(q);
+        const toCam = new THREE.Vector3().subVectors(camera.position, avatarRoot.position);
+        toCam.y = 0;
+        if (toCam.lengthSq() > 1e-6) toCam.normalize();
+        const dotPlus = fwd.dot(toCam);
+        const dotMinus = fwd.clone().multiplyScalar(-1).dot(toCam);
+        yawOffset = (dotMinus > dotPlus) ? Math.PI : 0;
+      }catch{
+        yawOffset = 0;
+      }
 
       // If we were using a lightweight fallback on mobile, swap to the real avatar now
       if (fallback){
@@ -692,7 +711,7 @@ function updateApproach(dt){
   pos.x = THREE.MathUtils.clamp(pos.x, -2.05, 2.05);
   pos.z = THREE.MathUtils.clamp(pos.z, -2.05, 2.05);
 
-  const yaw = Math.atan2(dir.x, dir.z);
+  const yaw = Math.atan2(dir.x, dir.z) + yawOffset;
   root.rotation.y = lerpAngle(root.rotation.y, yaw, 1 - Math.exp(-dt * 7));
 
   // subtle bob
@@ -753,7 +772,7 @@ function faceCameraYaw(dt, strength=10){
   // Blend: makes "look at the camera" feel stronger when camera is orbiting
   const dir = dirPos.clone().lerp(dirView, 0.35).normalize();
 
-  const targetYaw = Math.atan2(dir.x, dir.z);
+  const targetYaw = Math.atan2(dir.x, dir.z) + yawOffset;
   root.rotation.y = lerpAngle(root.rotation.y, targetYaw, 1 - Math.exp(-dt * strength));
 }
 
@@ -816,12 +835,14 @@ function lookAtCameraHead(dt){
 // Base pose (hands together, calm)
 const BASE = {
   // Calm idle: hands gently together in front (no T-pose, no arm flapping)
-  rUpperArm: new THREE.Euler(0.35, -0.30, 0.28),
-  rLowerArm: new THREE.Euler(-0.55, 0.10, 0.08),
-  rHand: new THREE.Euler(0.00, 0.00, 0.00),
-  lUpperArm: new THREE.Euler(0.35, 0.30, -0.28),
-  lLowerArm: new THREE.Euler(-0.55, -0.10, -0.08),
-  lHand: new THREE.Euler(0.00, 0.00, 0.00),
+  // NOTE: values are tuned for the bundled base_female VRM (many exports start in a T-pose).
+  // These are *stronger* than before to ensure arms come down instead of staying horizontal.
+  rUpperArm: new THREE.Euler(0.15, -0.20, 1.10),
+  rLowerArm: new THREE.Euler(-1.05, 0.10, 0.18),
+  rHand: new THREE.Euler(0.05, -0.10, 0.10),
+  lUpperArm: new THREE.Euler(0.15, 0.20, -1.10),
+  lLowerArm: new THREE.Euler(-1.05, -0.10, -0.18),
+  lHand: new THREE.Euler(0.05, 0.10, -0.10),
   chest: new THREE.Euler(0.00, 0.00, 0.00)
 };
 
@@ -1120,7 +1141,7 @@ function updateWander(dt){
     pos.x = THREE.MathUtils.clamp(pos.x, -2.05, 2.05);
     pos.z = THREE.MathUtils.clamp(pos.z, -2.05, 2.05);
 
-    const yaw = Math.atan2(dir.x, dir.z);
+    const yaw = Math.atan2(dir.x, dir.z) + yawOffset;
     root.rotation.y = lerpAngle(root.rotation.y, yaw, 1 - Math.exp(-dt * 4));
 
     // tiny step bob (subtle)
@@ -1299,7 +1320,7 @@ elText.addEventListener('keydown', (e) => {
   // Android에서 VRM 로딩이 매우 오래 걸리거나 멈춘 것처럼 보이는 경우가 있어,
   // 일정 시간 후에는 간편 아바타로 먼저 시작(로딩 화면 해제)하고,
   // VRM이 나중에 로딩되면 자동으로 교체합니다.
-  const fallbackDelay = isMobile() ? 10000 : 18000;
+  const fallbackDelay = isMobile() ? 6000 : 18000;
   const fallbackTimer = setTimeout(() => {
     showFallbackIfNeeded();
     if (elLoading) elLoading.style.display = 'none';
