@@ -1,6 +1,9 @@
-import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js';
-import { OrbitControls } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js';
-import { GLTFLoader } from 'https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/loaders/GLTFLoader.js';
+// GitHub Pages fix:
+// three-vrm imports 'three' as a bare module specifier.
+// We provide an importmap in index.html, so we can import from 'three' here too.
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { VRMLoaderPlugin, VRMUtils } from 'https://cdn.jsdelivr.net/npm/@pixiv/three-vrm@2.0.0/lib/three-vrm.module.js';
 
 const canvas = document.getElementById('c');
@@ -112,7 +115,12 @@ function speak(text) {
   u.pitch = Number(pitchEl.value || 1.0);
   u.rate = Number(rateEl.value || 1.0);
 
-  u.onstart = () => { speaking = true; startMouth(); };
+  u.onstart = () => {
+    speaking = true;
+    startMouth();
+    // Trigger a cute, natural reaction gesture/expression based on the sentence.
+    triggerReactionForText(text, { isBot: true });
+  };
   u.onend = () => { speaking = false; stopMouth(); };
   u.onerror = () => { speaking = false; stopMouth(); };
 
@@ -129,6 +137,178 @@ if (window.speechSynthesis) {
 // Three.js + VRM
 // ---------------------------
 let currentVrm = null;
+let rig = null;
+let basePose = null;
+let idleT = 0;
+let activeGesture = null;
+
+function getBone(name) {
+  try {
+    return currentVrm?.humanoid?.getNormalizedBoneNode?.(name) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function captureRigAndBasePose() {
+  rig = {
+    hips: getBone('hips'),
+    spine: getBone('spine'),
+    chest: getBone('chest'),
+    neck: getBone('neck'),
+    head: getBone('head'),
+    leftUpperArm: getBone('leftUpperArm'),
+    leftLowerArm: getBone('leftLowerArm'),
+    rightUpperArm: getBone('rightUpperArm'),
+    rightLowerArm: getBone('rightLowerArm'),
+  };
+  // Store base rotations so we can layer animations on top.
+  basePose = {};
+  for (const [k, node] of Object.entries(rig)) {
+    if (!node) continue;
+    basePose[k] = {
+      rx: node.rotation.x,
+      ry: node.rotation.y,
+      rz: node.rotation.z,
+    };
+  }
+}
+
+function setExpressionSafe(name, v) {
+  const em = currentVrm?.expressionManager;
+  if (!em) return;
+  try {
+    em.setValue(name, v);
+  } catch {
+    // Ignore missing expressions
+  }
+}
+
+function startGesture(type, duration = 0.8) {
+  activeGesture = { type, t: 0, duration };
+}
+
+function chooseEmotionFromText(text) {
+  const t = (text || '').toLowerCase();
+  if (/[!！]{1,}/.test(text)) return 'happy';
+  if (/[?？]{1,}/.test(text)) return 'thinking';
+  if (/(미안|sorry|슬프|힘들|우울|싫어|짜증|화나)/.test(t)) return 'sad';
+  if (/(ㅋㅋ|ㅎㅎ|lol|cute|귀엽)/.test(t)) return 'happy';
+  return 'neutral';
+}
+
+function triggerReactionForText(text, { isBot = true } = {}) {
+  const emo = chooseEmotionFromText(text);
+  // Expressions (if the model has them)
+  setExpressionSafe('happy', emo === 'happy' ? 0.45 : 0.0);
+  setExpressionSafe('sad', emo === 'sad' ? 0.5 : 0.0);
+  setExpressionSafe('angry', 0.0);
+  setExpressionSafe('surprised', /[!！]/.test(text) ? 0.25 : 0.0);
+
+  // After a moment, return to a mild baseline.
+  const token = Symbol('expr');
+  triggerReactionForText._lastToken = token;
+  setTimeout(() => {
+    if (triggerReactionForText._lastToken !== token) return;
+    setExpressionSafe('sad', 0.0);
+    setExpressionSafe('surprised', 0.0);
+    // Keep a slight "cute" happy baseline.
+    setExpressionSafe('happy', 0.25);
+  }, 1600);
+
+  // Gestures
+  if (emo === 'happy') {
+    startGesture(Math.random() < 0.5 ? 'wave' : 'bounce', 0.9);
+  } else if (emo === 'thinking') {
+    startGesture('tilt', 0.9);
+  } else if (emo === 'sad') {
+    startGesture('slump', 1.1);
+  } else {
+    startGesture(isBot ? 'nod' : 'ack', 0.6);
+  }
+}
+
+function applyIdle(dt) {
+  if (!rig || !basePose) return;
+  idleT += dt;
+
+  // Gentle sway & breathing
+  const sway = Math.sin(idleT * 1.2) * 0.06;
+  const breathe = Math.sin(idleT * 2.0) * 0.04;
+
+  if (rig.spine && basePose.spine) {
+    rig.spine.rotation.y = basePose.spine.ry + sway * 0.35;
+    rig.spine.rotation.x = basePose.spine.rx + breathe * 0.25;
+  }
+  if (rig.chest && basePose.chest) {
+    rig.chest.rotation.y = basePose.chest.ry + sway * 0.5;
+    rig.chest.rotation.x = basePose.chest.rx + breathe * 0.35;
+  }
+  if (rig.head && basePose.head) {
+    rig.head.rotation.y = basePose.head.ry + sway * 0.8;
+    rig.head.rotation.x = basePose.head.rx + Math.sin(idleT * 1.6) * 0.03;
+  }
+}
+
+function applyGesture(dt) {
+  if (!activeGesture || !rig || !basePose) return;
+  activeGesture.t += dt;
+  const p = Math.min(1, activeGesture.t / activeGesture.duration);
+
+  // Smooth step
+  const s = p * p * (3 - 2 * p);
+  const w = Math.sin(Math.PI * s);
+
+  const head = rig.head;
+  const neck = rig.neck;
+  const rUA = rig.rightUpperArm;
+  const rLA = rig.rightLowerArm;
+  const lUA = rig.leftUpperArm;
+  const lLA = rig.leftLowerArm;
+  const chest = rig.chest;
+
+  switch (activeGesture.type) {
+    case 'nod':
+      if (head && basePose.head) head.rotation.x = basePose.head.rx + 0.35 * w;
+      if (neck && basePose.neck) neck.rotation.x = basePose.neck.rx + 0.18 * w;
+      break;
+    case 'ack':
+      if (head && basePose.head) head.rotation.y = basePose.head.ry + 0.25 * Math.sin(Math.PI * 2 * s) * (1 - p);
+      break;
+    case 'tilt':
+      if (head && basePose.head) head.rotation.z = basePose.head.rz + 0.25 * w;
+      if (neck && basePose.neck) neck.rotation.z = basePose.neck.rz + 0.12 * w;
+      break;
+    case 'bounce':
+      if (chest && basePose.chest) chest.rotation.x = basePose.chest.rx - 0.22 * w;
+      if (head && basePose.head) head.rotation.x = basePose.head.rx - 0.18 * w;
+      break;
+    case 'slump':
+      if (chest && basePose.chest) chest.rotation.x = basePose.chest.rx + 0.28 * w;
+      if (head && basePose.head) head.rotation.x = basePose.head.rx + 0.25 * w;
+      if (head && basePose.head) head.rotation.z = basePose.head.rz + 0.08 * Math.sin(Math.PI * s);
+      break;
+    case 'wave':
+      // Simple wave with right arm
+      if (rUA && basePose.rightUpperArm) {
+        rUA.rotation.z = basePose.rightUpperArm.rz - 0.9 * w;
+        rUA.rotation.x = basePose.rightUpperArm.rx - 0.4 * w;
+      }
+      if (rLA && basePose.rightLowerArm) {
+        rLA.rotation.z = basePose.rightLowerArm.rz - 0.4 * w;
+        rLA.rotation.y = basePose.rightLowerArm.ry + 0.6 * Math.sin(Math.PI * 4 * s) * (1 - p);
+      }
+      if (head && basePose.head) head.rotation.x = basePose.head.rx - 0.08 * w;
+      break;
+    default:
+      break;
+  }
+
+  if (p >= 1) {
+    // Return arm rotations to base (idle will keep subtle motion)
+    activeGesture = null;
+  }
+}
 
 const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
@@ -173,9 +353,9 @@ async function loadVrm() {
         scene.add(vrm.scene);
 
         // Slightly “cute” expression baseline
-        if (vrm.expressionManager) {
-          vrm.expressionManager.setValue('happy', 0.25);
-        }
+        setExpressionSafe('happy', 0.25);
+        // Prepare bones for gestures
+        captureRigAndBasePose();
 
         addMessage('bot', '로딩 완료! 메시지를 보내면 읽어줄게 🙂');
         resolve(vrm);
@@ -216,6 +396,9 @@ function tick(now) {
 
   if (currentVrm) {
     currentVrm.update(dt);
+    // Layer cute idle + gesture animations on top of VRM's internal update.
+    applyIdle(dt);
+    applyGesture(dt);
   }
 
   renderer.render(scene, camera);
@@ -235,6 +418,8 @@ form.addEventListener('submit', (e) => {
   msgInput.value = '';
 
   addMessage('user', text);
+  // A small acknowledgement gesture when you talk to her.
+  triggerReactionForText(text, { isBot: false });
   const reply = makeReply(text);
 
   // Give a tiny delay for “chat-like” feel

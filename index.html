@@ -55,6 +55,20 @@
     <span>Avatar: VRoid Studio sample model (CC0)</span>
   </footer>
 
+  <!--
+    IMPORTANT (GitHub Pages fix):
+    Some ESM packages (e.g. three-vrm) import "three" as a *bare specifier*.
+    Browsers need an import map to resolve that.
+  -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+      }
+    }
+  </script>
+
   <script type="module" src="main.js"></script>
 </body>
 </html>
