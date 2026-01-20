@@ -25,8 +25,9 @@ body{
 #stageWrap{
   position:relative;
   flex:0 0 auto;
-  height:46svh;
-  min-height:260px;
+  /* Give a bit more room to chat on mobile */
+  height:40svh;
+  min-height:220px;
   border-bottom:1px solid var(--stroke);
 }
 
@@ -137,4 +138,15 @@ body{
   #stageWrap{height:100vh;flex:0 0 54vw;min-height:0;border-bottom:none;border-right:1px solid var(--stroke)}
   #chat{flex:1 1 auto}
   .bubble{max-width:80%}
+}
+
+/* Mobile: shrink chat text a bit, free more room for messages */
+@media (max-width: 480px){
+  #stageWrap{height:34svh;min-height:200px}
+  #messages{padding:12px 10px 8px 10px;font-size:14px}
+  .bubble{padding:9px 11px;border-radius:13px}
+  .bubble .who{font-size:11px}
+  #composer{padding:8px 10px;padding-bottom:calc(8px + env(safe-area-inset-bottom))}
+  #text{padding:9px 11px}
+  #send{padding:9px 12px}
 }

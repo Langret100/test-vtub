@@ -32,6 +32,13 @@ const clamp01 = (x) => Math.max(0, Math.min(1, x));
 const rand = (a,b) => a + Math.random()*(b-a);
 const easeInOut = (t) => (t < 0.5 ? 2*t*t : 1 - Math.pow(-2*t+2,2)/2);
 
+// three.js doesn't provide MathUtils.lerpAngle; implement shortest-path angle lerp.
+function lerpAngle(a, b, t){
+  const twoPi = Math.PI * 2;
+  const diff = THREE.MathUtils.euclideanModulo((b - a + Math.PI), twoPi) - Math.PI;
+  return a + diff * t;
+}
+
 function isMobile(){
   return matchMedia('(max-width: 879px)').matches || /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
 }
@@ -39,6 +46,10 @@ function isMobile(){
 // ---------------- TTS (Web Speech API) ----------------
 let ttsEnabled = localStorage.getItem('ttsEnabled') === '1';
 let speaking = false;
+let speakingText = '';
+let speechStartedAt = 0;
+let lipPlan = null;
+let lipPulse = 0;
 let cachedVoice = null;
 let voicesReadyPromise = null;
 
@@ -96,8 +107,12 @@ speechSynthesis?.addEventListener?.('voiceschanged', () => {
   voicesReadyPromise = null;
 });
 
+// Lip sync plan is generated below (Hangul vowel buckets) so we don't need a real phoneme engine.
+
 function speak(text){
   if (!ttsEnabled || !('speechSynthesis' in window)) return;
+  speakingText = text;
+  lipPlan = buildLipPlan(text);
   // iOS/모바일은 사용자 제스처 이후에만 안정적으로 재생되는 경우가 많아서
   // 버튼을 눌러 음성 허용을 켠 뒤에만 말하도록 처리.
   ensureVoiceCache().then(() => {
@@ -110,9 +125,15 @@ function speak(text){
       u.pitch = 1.28;
       u.rate = 1.06;
       u.volume = 1;
-      u.onstart = () => { speaking = true; };
+      u.onstart = () => { speaking = true; speechStartedAt = performance.now(); lipPulse = 0.35; };
       u.onend = () => { speaking = false; };
       u.onerror = () => { speaking = false; };
+      // 일부 브라우저(특히 데스크탑)는 boundary 이벤트를 지원함
+      // (안드로이드는 환경에 따라 지원이 들쭉날쭉해서, 지원되면 보너스 정도로 사용)
+      u.onboundary = (e) => {
+        // word/sentence boundary일 때 입을 살짝 더 크게
+        if (e?.name) lipPulse = 0.65;
+      };
       speechSynthesis.speak(u);
     }catch(e){
       console.warn('TTS failed', e);
@@ -164,7 +185,8 @@ if (isMobile()){
 function onResize(){
   const w = canvas.clientWidth;
   const h = canvas.clientHeight;
-  const dprCap = isMobile() ? 1.25 : 2;
+  // Android 성능/발열/메모리 이슈를 줄이기 위해 모바일 DPR 상한을 낮춤
+  const dprCap = isMobile() ? 1.05 : 2;
   renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, dprCap));
   renderer.setSize(w, h, false);
   camera.aspect = w / h;
@@ -313,6 +335,49 @@ function buildRoom(){
   );
   lamp.position.set(0.55, 1.02, -1.65);
   room.add(lamp);
+
+  // Bookshelf (low poly)
+  const shelfMat = new THREE.MeshStandardMaterial({ color: 0xa57a51, roughness: 0.9, metalness: 0.0 });
+  const shelf = new THREE.Mesh(new THREE.BoxGeometry(0.85, 1.35, 0.3), shelfMat);
+  shelf.position.set(-2.35, 0.675, -1.85);
+  shelf.rotation.y = Math.PI/2;
+  room.add(shelf);
+  const bookColors = [0xff6b6b, 0x6bcB77, 0x4d96ff, 0xffc300, 0x9b5de5];
+  for (let i=0;i<10;i++){
+    const b = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.18, 0.18), new THREE.MeshStandardMaterial({ color: bookColors[i%bookColors.length], roughness: 0.95 }));
+    b.position.set(-2.48 + rand(-0.03,0.03), 0.28 + Math.floor(i/5)*0.42, -1.98 + (i%5)*0.07);
+    b.rotation.y = Math.PI/2;
+    room.add(b);
+  }
+
+  // Wall clock
+  const clockBase = new THREE.Mesh(new THREE.CylinderGeometry(0.18,0.18,0.04,16), new THREE.MeshStandardMaterial({ color: 0xf6f2ea, roughness: 1 }));
+  clockBase.position.set(-0.35, 2.35, -2.93);
+  clockBase.rotation.x = Math.PI/2;
+  room.add(clockBase);
+  const clockHands = new THREE.Mesh(new THREE.BoxGeometry(0.02,0.12,0.01), new THREE.MeshStandardMaterial({ color: 0x22303f, roughness: 1 }));
+  clockHands.position.set(-0.35, 2.35, -2.91);
+  clockHands.rotation.z = 0.7;
+  room.add(clockHands);
+
+  // Desk items (books + chalk)
+  const book = new THREE.Mesh(new THREE.BoxGeometry(0.22,0.04,0.16), new THREE.MeshStandardMaterial({ color: 0x4d96ff, roughness: 0.95 }));
+  book.position.set(1.15, 0.83, -1.52);
+  room.add(book);
+  const chalk = new THREE.Mesh(new THREE.CylinderGeometry(0.01,0.01,0.1,10), new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 1 }));
+  chalk.position.set(0.1, 1.05, -2.88);
+  chalk.rotation.z = Math.PI/3;
+  room.add(chalk);
+
+  // Ceiling edge frame (ceiling itself is removed)
+  const beamMat = new THREE.MeshStandardMaterial({ color: 0xd7deea, roughness: 1.0 });
+  const beamA = new THREE.Mesh(new THREE.BoxGeometry(6, 0.08, 0.08), beamMat);
+  beamA.position.set(0, 2.98, -2.96);
+  room.add(beamA);
+  const beamB = new THREE.Mesh(new THREE.BoxGeometry(6, 0.08, 0.08), beamMat);
+  beamB.rotation.y = Math.PI/2;
+  beamB.position.set(-2.96, 2.98, 0);
+  room.add(beamB);
 }
 
 buildRoom();
@@ -324,6 +389,7 @@ vrmLoader.register((parser) => new VRMLoaderPlugin(parser, { autoUpdateHumanBone
 let vrm = null;
 let avatarRoot = null;
 let bones = {};
+let fallback = null;
 
 function toStandardMaterials(obj){
   obj.traverse((n) => {
@@ -381,6 +447,11 @@ function detectExpressions(){
   exprHappy = pickFirstAvailable(['happy', 'joy', 'Fun', 'smile']);
   exprSad = pickFirstAvailable(['sad', 'Sorrow']);
   exprAngry = pickFirstAvailable(['angry', 'Angry']);
+  // Surprise / shy are optional (model dependent)
+  // We'll set them if present.
+  // (names vary by exporter)
+  exprSurprise = pickFirstAvailable(['surprised', 'Surprised', 'surprise']);
+  exprShy = pickFirstAvailable(['blush', 'Blush', 'shy']);
 
   // Mouth shapes differ by model
   const a = pickFirstAvailable(['aa','A']);
@@ -391,6 +462,9 @@ function detectExpressions(){
   exprVowels = { a,i,u,e,o };
 }
 
+let exprSurprise = null;
+let exprShy = null;
+
 async function loadAvatar(){
   return new Promise((resolve) => {
     const timeout = setTimeout(() => {
@@ -399,7 +473,10 @@ async function loadAvatar(){
 
     const onProgress = (xhr) => {
       if (!xhr?.total) return;
-      const p = Math.round((xhr.loaded / xhr.total) * 100);
+      // Some servers report compressed totals; loaded can briefly exceed total.
+      // Clamp to 1..99 while loading; set to 100 only when onLoad fires.
+      const raw = (xhr.loaded / xhr.total) * 100;
+      const p = Math.max(1, Math.min(99, Math.round(raw)));
       setLoadingText('아바타 로딩중…', `${p}%`);
     };
 
@@ -421,6 +498,12 @@ async function loadAvatar(){
       avatarRoot.rotation.y = Math.PI * 0.15;
       scene.add(avatarRoot);
 
+      // If we were using a lightweight fallback on mobile, swap to the real avatar now
+      if (fallback){
+        scene.remove(fallback);
+        fallback = null;
+      }
+
       // 모바일 안정성: MToon 셰이더 대신 표준 머티리얼로 변환
       toStandardMaterials(avatarRoot);
 
@@ -440,7 +523,14 @@ async function loadAvatar(){
         rHand: h.getRawBoneNode(VRMHumanBoneName.RightHand),
         lUpperArm: h.getRawBoneNode(VRMHumanBoneName.LeftUpperArm),
         lLowerArm: h.getRawBoneNode(VRMHumanBoneName.LeftLowerArm),
-        lHand: h.getRawBoneNode(VRMHumanBoneName.LeftHand)
+        lHand: h.getRawBoneNode(VRMHumanBoneName.LeftHand),
+        // legs for a more natural walk cycle
+        rUpperLeg: h.getRawBoneNode(VRMHumanBoneName.RightUpperLeg),
+        rLowerLeg: h.getRawBoneNode(VRMHumanBoneName.RightLowerLeg),
+        rFoot: h.getRawBoneNode(VRMHumanBoneName.RightFoot),
+        lUpperLeg: h.getRawBoneNode(VRMHumanBoneName.LeftUpperLeg),
+        lLowerLeg: h.getRawBoneNode(VRMHumanBoneName.LeftLowerLeg),
+        lFoot: h.getRawBoneNode(VRMHumanBoneName.LeftFoot)
       };
 
       detectExpressions();
@@ -456,12 +546,62 @@ async function loadAvatar(){
   });
 }
 
+// ---------- Mobile fallback avatar (very light) ----------
+function createFallbackAvatar(){
+  const g = new THREE.Group();
+  const skin = new THREE.MeshStandardMaterial({ color: 0xffd3c4, roughness: 0.9, metalness: 0.0 });
+  const hair = new THREE.MeshStandardMaterial({ color: 0x223e7a, roughness: 0.95, metalness: 0.0 });
+  const cloth = new THREE.MeshStandardMaterial({ color: 0x3b4a6a, roughness: 0.95, metalness: 0.0 });
+
+  const body = new THREE.Mesh(new THREE.CapsuleGeometry(0.22, 0.48, 4, 12), cloth);
+  body.position.y = 0.62;
+  g.add(body);
+
+  const head = new THREE.Mesh(new THREE.SphereGeometry(0.18, 18, 18), skin);
+  head.position.y = 0.98;
+  g.add(head);
+
+  const hairCap = new THREE.Mesh(new THREE.SphereGeometry(0.185, 18, 18, 0, Math.PI*2, 0, Math.PI*0.62), hair);
+  hairCap.position.copy(head.position);
+  hairCap.position.y += 0.03;
+  g.add(hairCap);
+
+  // simple face (eyes + mouth plane)
+  const eyeMat = new THREE.MeshStandardMaterial({ color: 0x0b1220, roughness: 1.0 });
+  const eyeGeo = new THREE.SphereGeometry(0.016, 10, 10);
+  const eyeL = new THREE.Mesh(eyeGeo, eyeMat);
+  const eyeR = new THREE.Mesh(eyeGeo, eyeMat);
+  eyeL.position.set(-0.055, 1.02, 0.165);
+  eyeR.position.set( 0.055, 1.02, 0.165);
+  g.add(eyeL, eyeR);
+
+  const mouthGeo = new THREE.PlaneGeometry(0.06, 0.02);
+  const mouthMat = new THREE.MeshStandardMaterial({ color: 0x7a1c1c, roughness: 1.0, side: THREE.DoubleSide });
+  const mouth = new THREE.Mesh(mouthGeo, mouthMat);
+  mouth.position.set(0, 0.955, 0.17);
+  g.add(mouth);
+
+  g.userData = { head, mouth, eyeL, eyeR };
+  g.position.set(0.2, 0, -0.25);
+  g.rotation.y = Math.PI * 0.15;
+  return g;
+}
+
+function showFallbackIfNeeded(){
+  if (vrm || fallback) return;
+  fallback = createFallbackAvatar();
+  scene.add(fallback);
+  addBubble('시스템', '모바일 간편 모드로 먼저 시작할게요(더 빠름). 네트워크/기기 상태가 좋아지면 VRM 아바타도 자동으로 시도해요.');
+}
+
 // ---------------- Procedural animation ----------------
 const clock = new THREE.Clock();
 
 let blinkTimer = rand(2.2, 4.2);
 let blinkPhase = 0;
 let mouth = 0;
+let walkPhase = 0;
+let moveAmount = 0; // 0..1
 
 // Wandering around the diorama
 const wander = {
@@ -498,7 +638,7 @@ function faceCameraYaw(dt){
   if (toCam.lengthSq() < 1e-6) return;
   toCam.normalize();
   const targetYaw = Math.atan2(toCam.x, toCam.z);
-  avatarRoot.rotation.y = THREE.MathUtils.lerpAngle(avatarRoot.rotation.y, targetYaw, 1 - Math.exp(-dt * 7));
+  avatarRoot.rotation.y = lerpAngle(avatarRoot.rotation.y, targetYaw, 1 - Math.exp(-dt * 7));
 }
 
 function lookAtCameraHead(dt){
@@ -538,30 +678,41 @@ function slerpToEuler(bone, euler, alpha){
 }
 
 function applyUpperBodyPose(dt, state, alpha){
-  // state: {kind, wave, happy, sad, angry, talk}
+  // state: {kind, wave, happy, sad, angry, surprise, shy, think, talk, walk}
   const a = alpha ?? (1 - Math.exp(-dt * 10));
 
   const wave = state.wave || 0;
   const happy = state.happy || 0;
   const sad = state.sad || 0;
   const angry = state.angry || 0;
+  const surprise = state.surprise || 0;
+  const shy = state.shy || 0;
+  const think = state.think || 0;
   const talk = state.talk || 0;
+  const walk = state.walk || 0;
+
+  // When a gesture is active, we reduce walk arm swing
+  const gesturePower = Math.max(wave, happy, sad, angry, surprise, shy, think);
+  const walkSwing = walk * (1 - gesturePower);
 
   // Chest breathing + mild nod
   const breathe = Math.sin(clock.elapsedTime * 1.6) * 0.012;
   const nod = talk ? Math.sin(clock.elapsedTime * 2.8) * 0.04 * talk : 0;
   const chestEuler = new THREE.Euler(
-    BASE.chest.x + breathe + sad*0.10 - angry*0.03,
+    BASE.chest.x + breathe + sad*0.10 - angry*0.03 - shy*0.06 + surprise*0.06,
     0,
     0
   );
   slerpToEuler(bones.chest, chestEuler, a);
 
-  // Arms: calm by default, wave uses right arm
+  const sWalk = Math.sin(walkPhase);
+  const swing = 0.10 * walkSwing;
+
+  // Arms: calm by default, small swing when walking, gestures override
   const rUA = new THREE.Euler(
-    BASE.rUpperArm.x - 0.08*happy + 0.05*sad,
+    BASE.rUpperArm.x - 0.08*happy + 0.05*sad + swing*sWalk,
     BASE.rUpperArm.y,
-    BASE.rUpperArm.z
+    BASE.rUpperArm.z + swing*0.6
   );
   const rLA = new THREE.Euler(
     BASE.rLowerArm.x,
@@ -575,6 +726,24 @@ function applyUpperBodyPose(dt, state, alpha){
     rLA.set(-0.85, 0.18, 0.20);
   }
 
+  // Think: right hand near chin
+  if (think > 0){
+    rUA.set(0.10, -0.25, 0.75);
+    rLA.set(-1.05, 0.22, 0.10);
+  }
+
+  // Surprise: arms slightly up
+  if (surprise > 0){
+    rUA.set(-0.15, -0.35, 0.55);
+    rLA.set(-0.55, 0.12, 0.05);
+  }
+
+  // Shy: bring right hand in, closer to face
+  if (shy > 0){
+    rUA.set(0.25, -0.10, 0.65);
+    rLA.set(-0.95, 0.18, 0.10);
+  }
+
   slerpToEuler(bones.rUpperArm, rUA, a);
   slerpToEuler(bones.rLowerArm, rLA, a);
 
@@ -584,11 +753,25 @@ function applyUpperBodyPose(dt, state, alpha){
   }
 
   const lUA = new THREE.Euler(
-    BASE.lUpperArm.x - 0.08*happy + 0.05*sad,
+    BASE.lUpperArm.x - 0.08*happy + 0.05*sad - swing*sWalk,
     BASE.lUpperArm.y,
-    BASE.lUpperArm.z
+    BASE.lUpperArm.z - swing*0.6
   );
   const lLA = new THREE.Euler(BASE.lLowerArm.x, BASE.lLowerArm.y, BASE.lLowerArm.z);
+
+  if (think > 0){
+    // left arm supports a bit
+    lUA.set(0.30, 0.25, -0.55);
+    lLA.set(-0.55, -0.05, -0.10);
+  }
+  if (surprise > 0){
+    lUA.set(-0.10, 0.35, -0.55);
+    lLA.set(-0.55, -0.12, -0.05);
+  }
+  if (shy > 0){
+    lUA.set(0.30, 0.15, -0.65);
+    lLA.set(-0.85, -0.18, -0.10);
+  }
   slerpToEuler(bones.lUpperArm, lUA, a);
   slerpToEuler(bones.lLowerArm, lLA, a);
   slerpToEuler(bones.lHand, BASE.lHand, a);
@@ -605,14 +788,17 @@ let gesture = { type:'none', t:0, dur:0 };
 function startGesture(type, dur){ gesture = { type, t:0, dur }; }
 
 function gestureWeights(){
-  if (gesture.type === 'none' || gesture.dur <= 0) return { wave:0, happy:0, sad:0, angry:0 };
+  if (gesture.type === 'none' || gesture.dur <= 0) return { wave:0, happy:0, sad:0, angry:0, surprise:0, shy:0, think:0 };
   const t = clamp01(gesture.t / gesture.dur);
   const k = easeInOut(t);
-  if (gesture.type === 'wave') return { wave:k, happy:0, sad:0, angry:0 };
-  if (gesture.type === 'happy') return { wave:0, happy:k, sad:0, angry:0 };
-  if (gesture.type === 'sad') return { wave:0, happy:0, sad:k, angry:0 };
-  if (gesture.type === 'angry') return { wave:0, happy:0, sad:0, angry:k };
-  return { wave:0, happy:0, sad:0, angry:0 };
+  if (gesture.type === 'wave') return { wave:k, happy:0, sad:0, angry:0, surprise:0, shy:0, think:0 };
+  if (gesture.type === 'happy') return { wave:0, happy:k, sad:0, angry:0, surprise:0, shy:0, think:0 };
+  if (gesture.type === 'sad') return { wave:0, happy:0, sad:k, angry:0, surprise:0, shy:0, think:0 };
+  if (gesture.type === 'angry') return { wave:0, happy:0, sad:0, angry:k, surprise:0, shy:0, think:0 };
+  if (gesture.type === 'surprise') return { wave:0, happy:0, sad:0, angry:0, surprise:k, shy:0, think:0 };
+  if (gesture.type === 'shy') return { wave:0, happy:0, sad:0, angry:0, surprise:0, shy:k, think:0 };
+  if (gesture.type === 'think') return { wave:0, happy:0, sad:0, angry:0, surprise:0, shy:0, think:k };
+  return { wave:0, happy:0, sad:0, angry:0, surprise:0, shy:0, think:0 };
 }
 
 function updateGesture(dt){
@@ -624,7 +810,26 @@ function updateGesture(dt){
 }
 
 function updateBlink(dt){
-  if (!exprBlink) return;
+  // VRM blendshape blink
+  if (exprBlink){
+    blinkTimer -= dt;
+    if (blinkTimer <= 0){
+      blinkTimer = rand(2.0, 4.0);
+      blinkPhase = 0.12;
+    }
+    if (blinkPhase > 0){
+      blinkPhase -= dt;
+      const p = 1 - clamp01(blinkPhase / 0.12);
+      const b = Math.sin(p * Math.PI);
+      setExpression(exprBlink, b);
+    } else {
+      setExpression(exprBlink, 0);
+    }
+    return;
+  }
+
+  // Fallback avatar blink (scale eye spheres)
+  if (!fallback?.userData?.eyeL) return;
   blinkTimer -= dt;
   if (blinkTimer <= 0){
     blinkTimer = rand(2.0, 4.0);
@@ -634,9 +839,12 @@ function updateBlink(dt){
     blinkPhase -= dt;
     const p = 1 - clamp01(blinkPhase / 0.12);
     const b = Math.sin(p * Math.PI);
-    setExpression(exprBlink, b);
+    const sy = 1 - b * 0.92;
+    fallback.userData.eyeL.scale.y = sy;
+    fallback.userData.eyeR.scale.y = sy;
   } else {
-    setExpression(exprBlink, 0);
+    fallback.userData.eyeL.scale.y = 1;
+    fallback.userData.eyeR.scale.y = 1;
   }
 }
 
@@ -647,17 +855,75 @@ function setAllVowelsZero(){
 }
 
 function updateMouth(dt){
-  const target = speaking ? 0.55 + 0.25 * Math.sin(performance.now() * 0.016) : 0;
+  // lipPulse gives extra pop on boundary events, then decays
+  lipPulse = THREE.MathUtils.lerp(lipPulse, 0, 1 - Math.exp(-dt * 8));
+  const base = speaking ? 0.38 + 0.22 * Math.sin(performance.now() * 0.018) : 0;
+  const target = speaking ? (base + lipPulse * 0.5) : 0;
   mouth = THREE.MathUtils.lerp(mouth, target, 1 - Math.exp(-dt * 10));
 
-  setAllVowelsZero();
-  if (!speaking) return;
+  if (vrm) setAllVowelsZero();
+  if (!speaking){
+    if (fallback?.userData?.mouth){
+      fallback.userData.mouth.scale.set(1,1,1);
+    }
+    return;
+  }
 
-  const seq = ['a','i','u','e','o'];
-  const idx = Math.floor((performance.now() / 110) % seq.length);
-  const key = seq[idx];
-  const expr = exprVowels[key] || exprVowels.a;
-  if (expr) setExpression(expr, mouth);
+  const key = pickVowelFromPlan();
+  if (vrm){
+    const expr = exprVowels[key] || exprVowels.a;
+    if (expr) setExpression(expr, mouth);
+  } else if (fallback?.userData?.mouth){
+    // simple open/close by scaling mouth plane
+    fallback.userData.mouth.scale.y = 0.6 + mouth * 2.2;
+    fallback.userData.mouth.scale.x = 1.0 + mouth * 0.2;
+  }
+}
+
+// --- Simple Korean-vowel-based lip plan (works even without audio amplitude) ---
+function hangulVowelKey(ch){
+  const code = ch.charCodeAt(0);
+  if (code < 0xAC00 || code > 0xD7A3) return null;
+  const vIndex = Math.floor((code - 0xAC00) / 28) % 21;
+  // Map Jungseong to 5-ish buckets
+  // 0:ㅏ 2:ㅑ 9:ㅘ 10:ㅙ 11:ㅚ 1:ㅐ 3:ㅒ -> 'a/e'
+  // 20:ㅣ -> 'i'
+  // 8:ㅗ 12:ㅛ -> 'o'
+  // 13:ㅜ 17:ㅠ 14:ㅝ 15:ㅞ 16:ㅟ -> 'u'
+  // 4:ㅓ 6:ㅕ 7:ㅖ 5:ㅔ 18:ㅡ 19:ㅢ -> 'e/o'
+  if ([0,2,9,10].includes(vIndex)) return 'a';
+  if ([1,3,5,7].includes(vIndex)) return 'e';
+  if ([20].includes(vIndex)) return 'i';
+  if ([8,12,11].includes(vIndex)) return 'o';
+  if ([13,14,15,16,17].includes(vIndex)) return 'u';
+  if ([4,6].includes(vIndex)) return 'o';
+  if ([18,19].includes(vIndex)) return 'e';
+  return 'a';
+}
+
+function buildLipPlan(text){
+  const plan = [];
+  const t = (text || '').trim();
+  for (const ch of t){
+    const k = hangulVowelKey(ch);
+    if (k) plan.push(k);
+    // punctuation adds a tiny pause so mouth closes a bit
+    if (/[.!?…]/.test(ch)) plan.push('');
+  }
+  return plan.length ? plan : null;
+}
+
+function pickVowelFromPlan(){
+  if (!lipPlan || !speaking) {
+    const seq = ['a','i','u','e','o'];
+    return seq[Math.floor((performance.now() / 120) % seq.length)];
+  }
+  const elapsed = performance.now() - (speechStartedAt || performance.now());
+  const step = 95; // ms per mouth change
+  const idx = Math.floor(elapsed / step) % lipPlan.length;
+  const k = lipPlan[idx];
+  if (!k) return 'a';
+  return k;
 }
 
 function updateWander(dt){
@@ -676,15 +942,59 @@ function updateWander(dt){
   const dist = dir.length();
   if (dist > 0.03){
     dir.normalize();
-    const speed = 0.16;
-    pos.addScaledVector(dir, Math.min(dist, speed * dt));
+    const speed = 0.22;
+    const step = Math.min(dist, speed * dt);
+    pos.addScaledVector(dir, step);
+
+    // Keep inside the diorama floor
+    pos.x = THREE.MathUtils.clamp(pos.x, -2.05, 2.05);
+    pos.z = THREE.MathUtils.clamp(pos.z, -2.05, 2.05);
 
     const yaw = Math.atan2(dir.x, dir.z);
-    avatarRoot.rotation.y = THREE.MathUtils.lerpAngle(avatarRoot.rotation.y, yaw, 1 - Math.exp(-dt * 4));
+    avatarRoot.rotation.y = lerpAngle(avatarRoot.rotation.y, yaw, 1 - Math.exp(-dt * 4));
 
-    // tiny step bob (very subtle)
-    const bob = Math.sin(now * 6.0) * 0.006;
+    // tiny step bob (subtle)
+    const bob = Math.sin(now * 7.2) * 0.004;
     avatarRoot.position.y = bob;
+
+    // movement amount for walk cycle (0..1)
+    moveAmount = THREE.MathUtils.lerp(moveAmount, THREE.MathUtils.clamp(step / (speed * dt + 1e-6), 0, 1), 1 - Math.exp(-dt * 10));
+    walkPhase += dt * (6.0 + 4.0 * moveAmount);
+  }
+}
+
+function applyWalkCycle(dt){
+  if (!vrm) return;
+  const moving = moveAmount > 0.15 && wander.active && !speaking && gesture.type === 'none';
+  const a = 1 - Math.exp(-dt * 10);
+
+  // legs swing in opposite phase
+  const s = Math.sin(walkPhase);
+  const c = Math.cos(walkPhase);
+  const stride = moving ? 0.35 * moveAmount : 0;
+  const knee = moving ? 0.55 * moveAmount : 0;
+
+  // hips gentle sway
+  if (bones.hips){
+    const hipsQ = new THREE.Quaternion().setFromEuler(new THREE.Euler(0, 0, moving ? s * 0.03 : 0));
+    bones.hips.quaternion.slerp(hipsQ, a * 0.45);
+  }
+
+  // Right leg forward when sin positive
+  slerpToEuler(bones.rUpperLeg, new THREE.Euler( stride * s, 0, 0), a);
+  slerpToEuler(bones.lUpperLeg, new THREE.Euler(-stride * s, 0, 0), a);
+
+  // knees bend more when leg goes back (cos phase)
+  slerpToEuler(bones.rLowerLeg, new THREE.Euler( knee * Math.max(0, -c), 0, 0), a);
+  slerpToEuler(bones.lLowerLeg, new THREE.Euler( knee * Math.max(0, c), 0, 0), a);
+
+  // feet keep mostly flat
+  slerpToEuler(bones.rFoot, new THREE.Euler(-0.08 * stride * s, 0, 0), a);
+  slerpToEuler(bones.lFoot, new THREE.Euler( 0.08 * stride * s, 0, 0), a);
+
+  // decay to idle when not moving
+  if (!moving){
+    moveAmount = THREE.MathUtils.lerp(moveAmount, 0, 1 - Math.exp(-dt * 6));
   }
 }
 
@@ -725,6 +1035,21 @@ const RESPONSES = {
     '오늘 많이 피곤했구나. 물 한 잔 마실래?',
     '조금만 쉬었다가 다시 돌아오자. 내가 기다릴게!'
   ],
+  surprise: [
+    '에?! 진짜?! 😳',
+    '헉… 그건 예상 못했어!',
+    '와… 잠깐만, 다시 말해줘!'
+  ],
+  shy: [
+    '에헤… 그런 말 하면 나 부끄럽다… 🙈',
+    '그, 그런 말 갑자기 하면… 심장이…!',
+    '으으… 얼굴 빨개졌어…'
+  ],
+  think: [
+    '음… 잠깐만 생각해볼게…',
+    '흠… 그건 이렇게 볼 수도 있을 것 같아.',
+    '좋아, 하나씩 정리해보자.'
+  ],
   normal: [
     '오케이! 좀 더 자세히 말해줄래?',
     '음~ 그런 느낌이구나. 그 다음은?',
@@ -745,6 +1070,9 @@ function classify(text){
   if (has('고마','감사','thanks','thx')) return 'thanks';
   if (has('미안','sorry','죄송')) return 'sorry';
   if (has('졸려','피곤','잠','sleepy')) return 'sleepy';
+  if (has('놀라','헉','대박','진짜?','surprise')) return 'surprise';
+  if (has('부끄','귀여','사랑','좋아해','shy')) return 'shy';
+  if (has('생각','고민','흠','음…','think')) return 'think';
   return 'normal';
 }
 
@@ -760,12 +1088,17 @@ function reactTo(kind){
   else if (kind === 'happy') startGesture('happy', 1.4);
   else if (kind === 'sad') startGesture('sad', 1.7);
   else if (kind === 'angry') startGesture('angry', 1.2);
+  else if (kind === 'surprise') startGesture('surprise', 1.0);
+  else if (kind === 'shy') startGesture('shy', 1.4);
+  else if (kind === 'think') startGesture('think', 1.6);
   else startGesture('happy', 0.9);
 
   // Face expression (if available)
   if (kind === 'happy' && exprHappy){ setExpression(exprHappy, 0.9); setTimeout(() => setExpression(exprHappy, 0), 900); }
   if (kind === 'sad' && exprSad){ setExpression(exprSad, 0.9); setTimeout(() => setExpression(exprSad, 0), 1200); }
   if (kind === 'angry' && exprAngry){ setExpression(exprAngry, 0.8); setTimeout(() => setExpression(exprAngry, 0), 1000); }
+  if (kind === 'surprise' && exprSurprise){ setExpression(exprSurprise, 0.9); setTimeout(() => setExpression(exprSurprise, 0), 900); }
+  if (kind === 'shy' && exprShy){ setExpression(exprShy, 0.9); setTimeout(() => setExpression(exprShy, 0), 1200); }
 }
 
 function handleSend(){
@@ -791,7 +1124,17 @@ elText.addEventListener('keydown', (e) => {
   if (!ttsEnabled) addBubble('시스템', '모바일은 소리 재생을 위해 오른쪽 위의 “음성 켜기”를 한 번 눌러줘!');
 
   setLoadingText('아바타 로딩중…', '모바일은 처음 한 번만 조금 더 걸릴 수 있어요.');
+  // Android에서 VRM 로딩이 매우 오래 걸리거나 멈춘 것처럼 보이는 경우가 있어,
+  // 일정 시간 후에는 간편 아바타로 먼저 시작(로딩 화면 해제)하고,
+  // VRM이 나중에 로딩되면 자동으로 교체합니다.
+  const fallbackDelay = isMobile() ? 10000 : 18000;
+  const fallbackTimer = setTimeout(() => {
+    showFallbackIfNeeded();
+    if (elLoading) elLoading.style.display = 'none';
+  }, fallbackDelay);
+
   const ok = await loadAvatar();
+  clearTimeout(fallbackTimer);
   if (elLoading) elLoading.style.display = 'none';
 
   if (!ok){
@@ -822,7 +1165,9 @@ elText.addEventListener('keydown', (e) => {
     updateGesture(dt);
     const w = gestureWeights();
     const talk = speaking ? 1 : 0;
-    applyUpperBodyPose(dt, { kind:'idle', talk, ...w }, 1 - Math.exp(-dt * 9));
+    const walk = (wander.active && gesture.type === 'none' && !speaking) ? moveAmount : 0;
+    applyUpperBodyPose(dt, { kind:'idle', talk, walk, ...w }, 1 - Math.exp(-dt * 9));
+    applyWalkCycle(dt);
 
     // Happy bounce (subtle)
     if (avatarRoot){
