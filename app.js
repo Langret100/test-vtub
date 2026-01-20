@@ -1,624 +1,844 @@
-// GitHub Pages fix:
-// three-vrm imports 'three' as a bare module specifier.
-// We provide an importmap in index.html, so we can import from 'three' here too.
 import * as THREE from 'three';
-import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
-// IMPORTANT: three-vrm v2 can be incompatible with newer Three.js shader chunks (r157+),
-// and may cause MToon shader compile errors (e.g. "GeometricContext").
-// Use a recent three-vrm v3.x build that tracks newer Three.js revisions.
-import { VRMLoaderPlugin, VRMUtils } from 'https://cdn.jsdelivr.net/npm/@pixiv/three-vrm@3.4.5/lib/three-vrm.module.js';
-import { VRMAnimationLoaderPlugin, createVRMAnimationClip } from 'https://cdn.jsdelivr.net/npm/@pixiv/three-vrm-animation@3.4.5/lib/three-vrm-animation.module.js';
+import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
+import { VRMLoaderPlugin, VRMUtils, VRMHumanBoneName } from '@pixiv/three-vrm';
 
-const canvas = document.getElementById('c');
-const logEl = document.getElementById('log');
-const form = document.getElementById('form');
-const msgInput = document.getElementById('msg');
-const pitchEl = document.getElementById('pitch');
-const rateEl = document.getElementById('rate');
-const stopBtn = document.getElementById('stopBtn');
+// ---------------- UI ----------------
+const elMessages = document.getElementById('messages');
+const elText = document.getElementById('text');
+const elSend = document.getElementById('send');
+const elLoading = document.getElementById('loading');
+const elAudioGate = document.getElementById('audioGate');
 
-// ---------------------------
-// Chat helpers
-// ---------------------------
-function addMessage(who, text) {
-  const el = document.createElement('div');
-  el.className = `msg ${who}`;
-  const whoLabel = document.createElement('span');
-  whoLabel.className = 'who';
-  whoLabel.textContent = who === 'user' ? 'You' : 'VTuber';
-  const body = document.createElement('div');
-  body.textContent = text;
-  el.appendChild(whoLabel);
-  el.appendChild(body);
-  logEl.appendChild(el);
-  logEl.scrollTop = logEl.scrollHeight;
+function addBubble(who, text, isUser=false){
+  const wrap = document.createElement('div');
+  wrap.className = 'bubble' + (isUser ? ' user' : '');
+  wrap.innerHTML = `<div class="who"></div><div class="msg"></div>`;
+  wrap.querySelector('.who').textContent = who;
+  wrap.querySelector('.msg').textContent = text;
+  elMessages.appendChild(wrap);
+  elMessages.scrollTop = elMessages.scrollHeight;
 }
 
-// Very simple “VTuber-like” reply (demo).
-function pick(arr) {
-  return arr[Math.floor(Math.random() * arr.length)];
+function setLoadingText(title, desc=''){
+  const t = elLoading?.querySelector('.title');
+  const d = elLoading?.querySelector('.desc');
+  if (t) t.textContent = title;
+  if (d) d.textContent = desc;
 }
 
-function norm(s) {
-  return (s || '').trim();
+// ---------------- Helpers ----------------
+const clamp01 = (x) => Math.max(0, Math.min(1, x));
+const rand = (a,b) => a + Math.random()*(b-a);
+const easeInOut = (t) => (t < 0.5 ? 2*t*t : 1 - Math.pow(-2*t+2,2)/2);
+
+function isMobile(){
+  return matchMedia('(max-width: 879px)').matches || /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
 }
 
-function makeReply(userText) {
-  const t = norm(userText);
-  if (!t) return '응? 다시 한 번 말해줄래?';
-
-  // Greetings / small talk
-  if (/^(안녕|ㅎㅇ|하이|hello|hi)\b/i.test(t)) {
-    return pick([
-      '안녕! 오늘 기분 어때? 😊',
-      '하이하이~ 나 왔어! 뭐 할까?',
-      '안뇽! 만나서 반가워~',
-    ]);
-  }
-  if (/(고마워|thanks|thx)/i.test(t)) {
-    return pick(['에헤헤~ 천만에!', '별말을~ 도움이 되면 나도 좋아!', '언제든지 불러줘!']);
-  }
-  if (/(미안|sorry)/i.test(t)) {
-    return pick(['괜찮아 괜찮아~', '에이 괜찮지!', '신경 쓰지 마~']);
-  }
-  if (/(피곤|졸려|잠|sleep)/i.test(t)) {
-    return pick(['으앙… 나도 살짝 졸려… 같이 쉬었다 할까?', '따뜻한 물 한 잔 어때?', '잠깐 스트레칭하고 올래?']);
-  }
-
-  // Identity / playful
-  if (/(이름|누구|정체|누구야|who are you)/i.test(t)) {
-    return pick([
-      '나는 데모 VTuber야! 아직은 간단한 규칙 기반이지만, 점점 똑똑해질지도? 😚',
-      '나는 교실에 사는(?) 작은 VTuber~ 편하게 불러줘!',
-    ]);
-  }
-  if (/(사랑|좋아해|보고싶|love you)/i.test(t)) {
-    return pick([
-      '에엣… 갑자기 그런 말 하면 부끄럽잖아… 😳',
-      '나도 너 좋아~! (소곤소곤) 🤍',
-      '으아아… 심장 두근…!',
-    ]);
-  }
-  if (/(배고|밥|먹을|간식|치킨|떡볶이)/i.test(t)) {
-    return pick([
-      '간식 타임! 뭐 먹고 싶어? 난 달달한 거 땡겨~',
-      '배고프면 집중 안 돼! 같이 뭐 주워먹자 😋',
-      '치킨…? 나도 한 입만…!',
-    ]);
-  }
-  if (/(공부|숙제|시험|과제)/i.test(t)) {
-    return pick([
-      '공부는 싫지만… 같이 하면 할 만해! 25분 집중하고 5분 쉬자!',
-      '오케이, 오늘 목표 딱 하나만 정해볼래?',
-      '시험이면 컨디션이 제일 중요해. 물 마시고! 😤',
-    ]);
-  }
-
-  // Simple “opinions”
-  if (/[?？]$/.test(t) || /(왜|어떻게|뭐야|어떤)/.test(t)) {
-    return pick([
-      '음… 내 생각엔 이렇게 해보는 게 좋을 것 같아!',
-      '그거 좋은 질문이야. 한 번 같이 정리해볼까?',
-      '잠깐만… 머리 굴리는 중… 😳',
-    ]);
-  }
-
-  if (/(ㅋㅋ|ㅎㅎ|lol|귀엽|웃겨)/i.test(t)) {
-    return pick(['ㅋㅋㅋ 그치? 나도 웃겨!', '에헤헤~ 나도 빵 터졌어!', '앗 부끄럽다…']);
-  }
-
-  // Fallback
-  const echo = t.length > 24 ? t.slice(0, 24) + '…' : t;
-  return pick([
-    `응응, “${echo}” 맞지? 나도 그렇게 느껴! 그럼 너는 어떤 점이 제일 마음에 들어?`,
-    `오케이! “${echo}” 메모해둘게~ 다음으로 뭐부터 해볼까?`,
-    `좋아! 그럼 다음은 뭐 해볼까? 갑자기 궁금한 거 있어?`,
-  ]);
-}
-
-// ---------------------------
-// Web Speech (built-in TTS)
-// ---------------------------
-let voices = [];
+// ---------------- TTS (Web Speech API) ----------------
+let ttsEnabled = localStorage.getItem('ttsEnabled') === '1';
 let speaking = false;
-let selectedVoice = null;
-let mouthPulse = 0;
-let mouthShape = 'aa';
+let cachedVoice = null;
+let voicesReadyPromise = null;
 
-function scoreVoice(v) {
-  const lang = (v.lang || '').toLowerCase();
-  const name = (v.name || '').toLowerCase();
-  // We can't guarantee a "cute" voice across OSes, so we pick the best
-  // available Korean voice, then slightly raise pitch/rate.
-  const langScore = lang.startsWith('ko') ? 30 : (lang.startsWith('ja') ? 10 : 0);
-  const nameScore = /(heami|sunhi|seoyeon|yuna|kyoko|haruka|yuri|sora|karen|nana|moe|female|woman|girl)/.test(name) ? 3 : 0;
-  const localScore = v.localService ? 1 : 0;
-  return langScore + nameScore + localScore;
+function updateAudioGate(){
+  elAudioGate?.classList.toggle('hidden', ttsEnabled);
+}
+updateAudioGate();
+
+async function waitVoicesReady(timeoutMs=2500){
+  if (!('speechSynthesis' in window)) return [];
+  if (voicesReadyPromise) return voicesReadyPromise;
+
+  voicesReadyPromise = new Promise((resolve) => {
+    const t0 = performance.now();
+    const tick = () => {
+      const v = speechSynthesis.getVoices?.() ?? [];
+      if (v.length || performance.now() - t0 > timeoutMs){
+        resolve(v);
+        return;
+      }
+      setTimeout(tick, 100);
+    };
+    tick();
+  });
+
+  return voicesReadyPromise;
 }
 
-function refreshVoices() {
-  voices = window.speechSynthesis?.getVoices?.() ?? [];
-  selectedVoice = [...voices].sort((a, b) => scoreVoice(b) - scoreVoice(a))[0] || null;
-}
-
-function stopSpeaking() {
-  if (window.speechSynthesis) {
-    window.speechSynthesis.cancel();
-  }
-  speaking = false;
-  mouthPulse = 0;
-}
-
-stopBtn.addEventListener('click', stopSpeaking);
-
-function pulseMouth() {
-  // Short "open" envelope. We'll decay it in the render loop.
-  mouthPulse = Math.min(1, mouthPulse + 0.75);
-  mouthShape = pick(['aa', 'ih', 'ou', 'ee', 'oh']);
-}
-
-function speak(text) {
-  if (!window.speechSynthesis || !window.SpeechSynthesisUtterance) {
-    addMessage('bot', '이 브라우저는 Web Speech TTS를 지원하지 않아…');
-    return;
-  }
-
-  stopSpeaking();
-
-  const u = new SpeechSynthesisUtterance(text);
-  u.voice = selectedVoice || voices[0] || null;
-  // Default to a slightly "cute" tone.
-  u.pitch = Number(pitchEl.value || 1.35);
-  u.rate = Number(rateEl.value || 1.15);
-
-  // Approximate lip sync: boundary events (if supported) + lightweight fallback.
-  u.onboundary = () => pulseMouth();
-
-  u.onstart = () => {
-    speaking = true;
-    // Trigger a cute, natural reaction gesture/expression based on the sentence.
-    triggerReactionForText(text, { isBot: true });
+function pickCuteKoreanVoice(voices){
+  if (!voices?.length) return null;
+  const ko = voices.filter(v => (v.lang || '').toLowerCase().startsWith('ko'));
+  const score = (v) => {
+    const name = (v.name || '').toLowerCase();
+    let s = 0;
+    if ((v.lang || '').toLowerCase().startsWith('ko')) s += 10;
+    if (name.includes('female')) s += 2;
+    if (name.includes('heami')) s += 4;
+    if (name.includes('seoyeon')) s += 3;
+    if (name.includes('jiyoung')) s += 2;
+    if (name.includes('google')) s += 1;
+    return s;
   };
-  u.onend = () => { speaking = false; mouthPulse = 0; };
-  u.onerror = () => { speaking = false; mouthPulse = 0; };
-
-  window.speechSynthesis.speak(u);
+  const pool = ko.length ? ko : voices;
+  return [...pool].sort((a,b) => score(b) - score(a))[0] || pool[0] || null;
 }
 
-// Some browsers load voices async
-if (window.speechSynthesis) {
-  window.speechSynthesis.onvoiceschanged = refreshVoices;
-  refreshVoices();
+async function ensureVoiceCache(){
+  if (cachedVoice) return;
+  const voices = await waitVoicesReady();
+  cachedVoice = pickCuteKoreanVoice(voices);
 }
 
-// ---------------------------
-// Three.js + VRM
-// ---------------------------
-let currentVrm = null;
-let mixer = null;
-let idleAction = null;
-let currentAction = null;
-const vrmaCache = new Map(); // fileName -> AnimationClip
+speechSynthesis?.addEventListener?.('voiceschanged', () => {
+  cachedVoice = null;
+  voicesReadyPromise = null;
+});
 
-const VRMA_BASE_URL = 'https://raw.githubusercontent.com/tk256ailab/vrm-viewer/main/VRMA/';
-const MOTIONS = {
-  idle: 'Relax.vrma',
-  greeting: 'Goodbye.vrma',
-  happy: 'Blush.vrma',
-  clap: 'Clapping.vrma',
-  sad: 'Sad.vrma',
-  surprised: 'Surprised.vrma',
-  thinking: 'Thinking.vrma',
-  sleepy: 'Sleepy.vrma',
-  jump: 'Jump.vrma',
-  look: 'LookAround.vrma',
-  angry: 'Angry.vrma',
-};
-
-const vrmaLoader = new GLTFLoader();
-vrmaLoader.register((parser) => new VRMAnimationLoaderPlugin(parser));
-
-function setExpressionSafe(name, v) {
-  const em = currentVrm?.expressionManager;
-  if (!em) return;
-  try {
-    em.setValue(name, v);
-  } catch {
-    // Ignore missing expressions
-  }
-}
-
-async function loadMotionClip(fileName) {
-  if (vrmaCache.has(fileName)) return vrmaCache.get(fileName);
-  const gltf = await vrmaLoader.loadAsync(VRMA_BASE_URL + fileName);
-  const vrmAnim = gltf.userData.vrmAnimations?.[0];
-  if (!vrmAnim) throw new Error('VRMA has no vrmAnimations');
-  const clip = createVRMAnimationClip(vrmAnim, currentVrm);
-  vrmaCache.set(fileName, clip);
-  return clip;
-}
-
-async function ensureIdle() {
-  if (!currentVrm) return;
-  if (!mixer) mixer = new THREE.AnimationMixer(currentVrm.scene);
-  if (idleAction) return;
-  const clip = await loadMotionClip(MOTIONS.idle);
-  idleAction = mixer.clipAction(clip);
-  idleAction.setLoop(THREE.LoopRepeat, Infinity);
-  idleAction.enabled = true;
-  idleAction.play();
-  currentAction = idleAction;
-}
-
-function crossFadeTo(nextAction, fade = 0.25) {
-  if (!nextAction) return;
-  if (currentAction && currentAction !== nextAction) {
-    nextAction.reset();
-    nextAction.enabled = true;
-    nextAction.play();
-    currentAction.crossFadeTo(nextAction, fade, false);
-  } else {
-    nextAction.reset();
-    nextAction.enabled = true;
-    nextAction.play();
-  }
-  currentAction = nextAction;
-}
-
-async function playOneShot(fileName, { fade = 0.2, strength = 1.0 } = {}) {
-  if (!currentVrm) return;
-  await ensureIdle();
-  const clip = await loadMotionClip(fileName);
-  const a = mixer.clipAction(clip);
-  a.setEffectiveWeight(strength);
-  a.setLoop(THREE.LoopOnce, 1);
-  a.clampWhenFinished = true;
-
-  // Fade out any non-idle action quickly.
-  if (currentAction && currentAction !== idleAction) {
-    currentAction.fadeOut(0.12);
-  }
-  crossFadeTo(a, fade);
-
-  // Return to idle when finished.
-  const onFinished = (e) => {
-    if (e.action !== a) return;
-    mixer.removeEventListener('finished', onFinished);
-    if (idleAction) {
-      idleAction.reset();
-      idleAction.enabled = true;
-      idleAction.play();
-      a.crossFadeTo(idleAction, 0.25, false);
-      currentAction = idleAction;
+function speak(text){
+  if (!ttsEnabled || !('speechSynthesis' in window)) return;
+  // iOS/모바일은 사용자 제스처 이후에만 안정적으로 재생되는 경우가 많아서
+  // 버튼을 눌러 음성 허용을 켠 뒤에만 말하도록 처리.
+  ensureVoiceCache().then(() => {
+    try{
+      speechSynthesis.cancel();
+      const u = new SpeechSynthesisUtterance(text);
+      if (cachedVoice) u.voice = cachedVoice;
+      u.lang = cachedVoice?.lang || 'ko-KR';
+      // "귀엽게" 들리도록 살짝 높은 피치 + 약간 빠른 속도
+      u.pitch = 1.28;
+      u.rate = 1.06;
+      u.volume = 1;
+      u.onstart = () => { speaking = true; };
+      u.onend = () => { speaking = false; };
+      u.onerror = () => { speaking = false; };
+      speechSynthesis.speak(u);
+    }catch(e){
+      console.warn('TTS failed', e);
     }
-  };
-  mixer.addEventListener('finished', onFinished);
+  });
 }
 
-function chooseEmotionFromText(text) {
-  const t = (text || '').toLowerCase();
-  if (/(피곤|졸려|잠|sleep)/.test(t)) return 'sleepy';
-  if (/[!！]{1,}/.test(text)) return 'surprised';
-  if (/[?？]{1,}/.test(text)) return 'thinking';
-  if (/(미안|sorry|슬프|힘들|우울|싫어)/.test(t)) return 'sad';
-  if (/(짜증|화나|angry)/.test(t)) return 'angry';
-  if (/(ㅋㅋ|ㅎㅎ|lol|귀엽|좋아|최고)/.test(t)) return 'happy';
-  return 'neutral';
-}
+elAudioGate?.addEventListener('click', () => {
+  ttsEnabled = true;
+  localStorage.setItem('ttsEnabled', '1');
+  updateAudioGate();
+  addBubble('시스템', '음성을 켰어요. 이제부터 캐릭터가 읽어줄게요!');
+  // Prime voices
+  ensureVoiceCache();
+});
 
-function triggerReactionForText(text, { isBot = true } = {}) {
-  const emo = chooseEmotionFromText(text);
-  // Expressions (if the model has them)
-  setExpressionSafe('happy', emo === 'happy' ? 0.55 : 0.18);
-  setExpressionSafe('sad', emo === 'sad' ? 0.55 : 0.0);
-  setExpressionSafe('angry', emo === 'angry' ? 0.45 : 0.0);
-  setExpressionSafe('surprised', emo === 'surprised' ? 0.35 : 0.0);
-  setExpressionSafe('relaxed', 0.15);
-
-  // After a moment, return to a mild baseline.
-  const token = Symbol('expr');
-  triggerReactionForText._lastToken = token;
-  setTimeout(() => {
-    if (triggerReactionForText._lastToken !== token) return;
-    setExpressionSafe('sad', 0.0);
-    setExpressionSafe('surprised', 0.0);
-    // Keep a slight "cute" happy baseline.
-    setExpressionSafe('angry', 0.0);
-    setExpressionSafe('happy', 0.18);
-  }, 1600);
-  // Motions (VRMA one-shots). If it fails to load (network blocked), expressions still work.
-  const looksLikeGreeting = /^(안녕|ㅎㅇ|하이|hello|hi)\\b/i.test((text || '').trim());
-  if (looksLikeGreeting && isBot) {
-    playOneShot(MOTIONS.greeting).catch(() => {});
-    return;
-  }
-
-  const map = {
-    happy: () => playOneShot(Math.random() < 0.45 ? MOTIONS.happy : MOTIONS.clap),
-    sad: () => playOneShot(MOTIONS.sad),
-    surprised: () => playOneShot(MOTIONS.surprised),
-    thinking: () => playOneShot(MOTIONS.thinking),
-    sleepy: () => playOneShot(MOTIONS.sleepy, { strength: 0.95 }),
-    angry: () => playOneShot(MOTIONS.angry, { strength: 0.95 }),
-    neutral: () => (Math.random() < 0.22 ? playOneShot(MOTIONS.look, { strength: 0.9 }) : Promise.resolve()),
-  };
-  (map[emo] || map.neutral)().catch(() => {});
-}
-
-// WebGL2 check: three-vrm MToon shaders use GLSL3 features.
-// If the device/browser falls back to WebGL1, MToon may fail to compile.
-const gl2 = canvas.getContext('webgl2', { antialias: true, alpha: true });
-const supportsWebGL2 = !!gl2;
-if (!supportsWebGL2) {
-  console.warn('[VTuber] WebGL2 not available. Falling back to basic materials (no MToon).');
-  addMessage('bot', '⚠️ 이 기기에서는 WebGL2가 꺼져있거나 지원되지 않아, 간단한 재질로 표시할게.');
-}
-
+// ---------------- Three.js ----------------
+const canvas = document.getElementById('stage');
 const renderer = new THREE.WebGLRenderer({
   canvas,
-  context: gl2 || undefined,
-  antialias: true,
-  alpha: true,
+  antialias: !isMobile(),
+  alpha: false,
+  powerPreference: 'high-performance'
 });
-renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-renderer.setSize(canvas.clientWidth, canvas.clientHeight, false);
+renderer.setClearColor(0x0b1220, 1);
 renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.0;
 
 const scene = new THREE.Scene();
-// Classroom-like background (free photo).
-// NOTE: We load from a free CDN-friendly host to keep this repo small.
-const BG_URL = 'https://images.pexels.com/photos/289740/pexels-photo-289740.jpeg?auto=compress&cs=tinysrgb&w=1600';
-{
-  const texLoader = new THREE.TextureLoader();
-  texLoader.setCrossOrigin('anonymous');
-  texLoader.load(
-    BG_URL,
-    (tex) => {
-      tex.colorSpace = THREE.SRGBColorSpace;
-      scene.background = tex;
-    },
-    undefined,
-    () => {
-      // fallback
-      scene.background = new THREE.Color(0x0b0f14);
-    }
-  );
-}
-scene.fog = new THREE.Fog(0x0b0f14, 2.2, 7.0);
+scene.fog = new THREE.Fog(0x0b1220, 6, 18);
 
-const camera = new THREE.PerspectiveCamera(30, 1, 0.1, 100);
-camera.position.set(0, 1.35, 2.4);
+const camera = new THREE.PerspectiveCamera(35, 1, 0.1, 100);
+camera.position.set(0.0, 1.35, 3.15);
 
-const controls = new OrbitControls(camera, renderer.domElement);
-controls.target.set(0, 1.25, 0);
+const controls = new OrbitControls(camera, canvas);
 controls.enableDamping = true;
-
-scene.add(new THREE.HemisphereLight(0xffffff, 0x223344, 1.1));
-const dir = new THREE.DirectionalLight(0xffffff, 1.1);
-dir.position.set(1.5, 2.5, 2.0);
-scene.add(dir);
-
-// Simple floor to ground the avatar.
-{
-  const g = new THREE.PlaneGeometry(10, 10);
-  const m = new THREE.MeshStandardMaterial({ color: 0x0f1722, roughness: 1.0, metalness: 0.0 });
-  const floor = new THREE.Mesh(g, m);
-  floor.rotation.x = -Math.PI / 2;
-  floor.position.y = 0;
-  floor.receiveShadow = false;
-  scene.add(floor);
+controls.target.set(0, 1.2, 0);
+controls.minDistance = 1.6;
+controls.maxDistance = 6.0;
+controls.maxPolarAngle = Math.PI * 0.49;
+controls.minPolarAngle = Math.PI * 0.18;
+controls.enablePan = false;
+if (isMobile()){
+  // 모바일은 제스처 충돌을 줄이기 위해 회전만 허용
+  controls.enableZoom = true;
 }
 
-function cloneBasicMaterial(src, isSkinned) {
-  // Replace MToon (custom toon shader) with a standard PBR material to keep WebGL1 compatibility.
-  const dst = new THREE.MeshStandardMaterial();
-  if (src.color) dst.color.copy(src.color);
-  if (src.map) dst.map = src.map;
-  if (src.normalMap) dst.normalMap = src.normalMap;
-  if (src.emissive) dst.emissive.copy(src.emissive);
-  if (src.emissiveMap) dst.emissiveMap = src.emissiveMap;
-  if (src.roughness != null) dst.roughness = src.roughness;
-  if (src.metalness != null) dst.metalness = src.metalness;
-
-  // Transparency / cutout
-  dst.transparent = !!src.transparent;
-  dst.opacity = src.opacity != null ? src.opacity : 1;
-  dst.alphaTest = src.alphaTest != null ? src.alphaTest : 0;
-  dst.depthWrite = src.depthWrite != null ? src.depthWrite : true;
-  dst.side = src.side != null ? src.side : THREE.FrontSide;
-
-  // Skinning
-  dst.skinning = !!isSkinned;
-
-  dst.needsUpdate = true;
-  return dst;
-}
-
-function downgradeMaterialsForWebGL1(root) {
-  root.traverse((obj) => {
-    if (!obj.isMesh) return;
-    const isSkinned = !!obj.isSkinnedMesh;
-    const mats = Array.isArray(obj.material) ? obj.material : [obj.material];
-    const newMats = mats.map((m) => {
-      if (!m) return m;
-      // Avoid cloning if it's already a standard material
-      const type = (m.type || '').toLowerCase();
-      if (type.includes('standard') || type.includes('phong') || type.includes('lambert')) {
-        if (isSkinned && m.skinning !== true) {
-          m.skinning = true;
-          m.needsUpdate = true;
-        }
-        return m;
-      }
-      return cloneBasicMaterial(m, isSkinned);
-    });
-    obj.material = Array.isArray(obj.material) ? newMats : newMats[0];
-  });
-}
-
-const loader = new GLTFLoader();
-loader.register((parser) => new VRMLoaderPlugin(parser));
-
-async function loadVrm() {
-  addMessage('bot', '아바타 로딩중…');
-  return new Promise((resolve, reject) => {
-    loader.load(
-      './assets/Base_Female.vrm',
-      (gltf) => {
-        const vrm = gltf.userData.vrm;
-        VRMUtils.removeUnnecessaryVertices(gltf.scene);
-        VRMUtils.removeUnnecessaryJoints(gltf.scene);
-
-        if (currentVrm) {
-          scene.remove(currentVrm.scene);
-        }
-        currentVrm = vrm;
-
-        if (!supportsWebGL2) {
-          // Make the avatar visible on WebGL1 by replacing MToon materials.
-          downgradeMaterialsForWebGL1(vrm.scene);
-        }
-
-
-        // Nice default pose/position
-        vrm.scene.rotation.y = Math.PI; // face camera
-        scene.add(vrm.scene);
-
-        // Slightly “cute” expression baseline
-        setExpressionSafe('happy', 0.18);
-        setExpressionSafe('relaxed', 0.15);
-
-        // Start the default idle VRMA motion to avoid T-pose.
-        ensureIdle()
-          .then(() => {
-            // Preload a few common one-shots in the background (best effort).
-            [MOTIONS.greeting, MOTIONS.happy, MOTIONS.thinking, MOTIONS.surprised].forEach((m) => {
-              loadMotionClip(m).catch(() => {});
-            });
-          })
-          .catch(() => {
-            // If VRMA fails to load (offline/CORS), we still show the model.
-          });
-
-        addMessage('bot', '로딩 완료! (교실 배경 + 기본 모션 적용)');
-        resolve(vrm);
-      },
-      undefined,
-      (err) => {
-        console.error(err);
-        addMessage('bot', '아바타 로딩에 실패했어…');
-        reject(err);
-      }
-    );
-  });
-}
-
-const VISEMES = ['aa', 'ih', 'ou', 'ee', 'oh'];
-function setMouthShape(shape, amount) {
-  const em = currentVrm?.expressionManager;
-  if (!em) return;
-  for (const k of VISEMES) {
-    em.setValue(k, k === shape ? amount : 0);
-  }
-}
-
-function resize() {
+function onResize(){
   const w = canvas.clientWidth;
   const h = canvas.clientHeight;
+  const dprCap = isMobile() ? 1.25 : 2;
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, dprCap));
   renderer.setSize(w, h, false);
   camera.aspect = w / h;
   camera.updateProjectionMatrix();
 }
+window.addEventListener('resize', onResize);
+window.addEventListener('orientationchange', () => setTimeout(onResize, 200));
 
-window.addEventListener('resize', resize);
+// Lights
+scene.add(new THREE.AmbientLight(0xffffff, 0.55));
+const key = new THREE.DirectionalLight(0xffffff, 1.15);
+key.position.set(2.5, 4.0, 2.0);
+scene.add(key);
+const rim = new THREE.DirectionalLight(0xffffff, 0.35);
+rim.position.set(-2.5, 2.2, -2.8);
+scene.add(rim);
 
-let last = performance.now();
-let blinkCooldown = 1.8 + Math.random() * 2.8;
-let blinkPhase = 0; // 0 = idle, >0 = blinking seconds
+// ---------------- Classroom corner diorama (no roof, no front wall) ----------------
+const room = new THREE.Group();
+scene.add(room);
 
-function updateBlink(dt) {
-  if (!currentVrm) return;
+function makePosterTexture(){
+  const c = document.createElement('canvas');
+  c.width = 512;
+  c.height = 512;
+  const ctx = c.getContext('2d');
+  ctx.fillStyle = '#f2f5fb';
+  ctx.fillRect(0,0,c.width,c.height);
+  ctx.fillStyle = '#0b1220';
+  ctx.font = 'bold 46px system-ui, sans-serif';
+  ctx.fillText('오늘의', 42, 92);
+  ctx.fillText('한마디', 42, 150);
+  ctx.font = '28px system-ui, sans-serif';
+  ctx.fillStyle = '#334155';
+  const lines = [
+    '1) 인사 / 기쁨 / 슬픔 / 화남',
+    '2) "고마워" / "미안" / "졸려"',
+    '3) 그냥 아무 말이나 해도 돼요'
+  ];
+  lines.forEach((l,i)=>ctx.fillText(l, 42, 230 + i*44));
+  ctx.fillStyle = '#1d4ed8';
+  ctx.fillRect(42, 360, 428, 6);
+  ctx.fillStyle = '#0b1220';
+  ctx.font = 'bold 34px system-ui, sans-serif';
+  ctx.fillText('VTuber 교실', 42, 430);
 
-  if (blinkPhase > 0) {
-    blinkPhase += dt;
-    // A quick smooth blink
-    const dur = 0.12;
-    const x = Math.min(1, blinkPhase / dur);
-    const v = Math.sin(x * Math.PI); // 0->1->0
-    setExpressionSafe('blink', v);
-    if (blinkPhase >= dur) {
-      blinkPhase = 0;
-      setExpressionSafe('blink', 0);
-      blinkCooldown = 1.6 + Math.random() * 3.6;
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+
+function buildRoom(){
+  // Floor
+  const floorMat = new THREE.MeshStandardMaterial({ color: 0x8a6a4a, roughness: 0.92, metalness: 0.0 });
+  const floor = new THREE.Mesh(new THREE.PlaneGeometry(6, 6), floorMat);
+  floor.rotation.x = -Math.PI/2;
+  floor.position.y = 0;
+  room.add(floor);
+
+  // Walls (corner)
+  const wallMat = new THREE.MeshStandardMaterial({ color: 0xcfd7e6, roughness: 1.0, metalness: 0.0 });
+  const wallA = new THREE.Mesh(new THREE.PlaneGeometry(6, 3), wallMat);
+  wallA.position.set(0, 1.5, -3);
+  room.add(wallA);
+
+  const wallB = new THREE.Mesh(new THREE.PlaneGeometry(6, 3), wallMat);
+  wallB.rotation.y = Math.PI/2;
+  wallB.position.set(-3, 1.5, 0);
+  room.add(wallB);
+
+  // Base trim
+  const trimMat = new THREE.MeshStandardMaterial({ color: 0xb6c4dc, roughness: 1.0, metalness: 0.0 });
+  const trimA = new THREE.Mesh(new THREE.BoxGeometry(6, 0.08, 0.12), trimMat);
+  trimA.position.set(0, 0.04, -2.94);
+  room.add(trimA);
+  const trimB = new THREE.Mesh(new THREE.BoxGeometry(6, 0.08, 0.12), trimMat);
+  trimB.rotation.y = Math.PI/2;
+  trimB.position.set(-2.94, 0.04, 0);
+  room.add(trimB);
+
+  // Blackboard
+  const frameMat = new THREE.MeshStandardMaterial({ color: 0x3a2e24, roughness: 0.9, metalness: 0.0 });
+  const boardMat = new THREE.MeshStandardMaterial({ color: 0x1f3b2e, roughness: 0.95, metalness: 0.0 });
+  const boardFrame = new THREE.Mesh(new THREE.BoxGeometry(2.7, 1.5, 0.06), frameMat);
+  boardFrame.position.set(0.9, 1.55, -2.95);
+  room.add(boardFrame);
+  const board = new THREE.Mesh(new THREE.PlaneGeometry(2.56, 1.36), boardMat);
+  board.position.set(0.9, 1.55, -2.92);
+  room.add(board);
+
+  // Poster
+  const posterTex = makePosterTexture();
+  const posterMat = new THREE.MeshStandardMaterial({ map: posterTex, roughness: 0.95, metalness: 0.0 });
+  const poster = new THREE.Mesh(new THREE.PlaneGeometry(0.95, 0.95), posterMat);
+  poster.position.set(-2.92, 1.25, -0.2);
+  poster.rotation.y = Math.PI/2;
+  room.add(poster);
+
+  // Window
+  const winFrame = new THREE.Mesh(new THREE.BoxGeometry(1.6, 1.1, 0.06), frameMat);
+  winFrame.position.set(-2.92, 1.55, 1.35);
+  winFrame.rotation.y = Math.PI/2;
+  room.add(winFrame);
+  const glassMat = new THREE.MeshStandardMaterial({ color: 0x9dd2ff, transparent: true, opacity: 0.22, roughness: 0.1, metalness: 0.0 });
+  const glass = new THREE.Mesh(new THREE.PlaneGeometry(1.5, 1.0), glassMat);
+  glass.position.set(-2.89, 1.55, 1.35);
+  glass.rotation.y = Math.PI/2;
+  room.add(glass);
+
+  // Desk (simple)
+  const deskTop = new THREE.Mesh(
+    new THREE.BoxGeometry(1.2, 0.08, 0.65),
+    new THREE.MeshStandardMaterial({ color: 0xb98a5e, roughness: 0.85, metalness: 0.0 })
+  );
+  deskTop.position.set(0.85, 0.78, -1.55);
+  room.add(deskTop);
+  const legMat = new THREE.MeshStandardMaterial({ color: 0x8a96a8, roughness: 0.9, metalness: 0.0 });
+  const legGeo = new THREE.BoxGeometry(0.06, 0.78, 0.06);
+  const legs = [
+    [-0.55, -0.28], [0.55, -0.28], [-0.55, 0.28], [0.55, 0.28]
+  ];
+  legs.forEach(([x,z])=>{
+    const leg = new THREE.Mesh(legGeo, legMat);
+    leg.position.set(0.85 + x*0.9, 0.39, -1.55 + z*0.9);
+    room.add(leg);
+  });
+
+  // Chair
+  const seat = new THREE.Mesh(new THREE.BoxGeometry(0.55, 0.06, 0.55), new THREE.MeshStandardMaterial({ color: 0x6d7f97, roughness: 0.9 }));
+  seat.position.set(0.35, 0.45, -1.25);
+  room.add(seat);
+  const back = new THREE.Mesh(new THREE.BoxGeometry(0.55, 0.5, 0.06), new THREE.MeshStandardMaterial({ color: 0x6d7f97, roughness: 0.9 }));
+  back.position.set(0.35, 0.74, -1.5);
+  room.add(back);
+  const chairLegGeo = new THREE.BoxGeometry(0.05, 0.45, 0.05);
+  [[-0.22,-0.22],[0.22,-0.22],[-0.22,0.22],[0.22,0.22]].forEach(([x,z])=>{
+    const leg = new THREE.Mesh(chairLegGeo, legMat);
+    leg.position.set(0.35 + x, 0.225, -1.25 + z);
+    room.add(leg);
+  });
+
+  // Small lamp (emissive)
+  const lamp = new THREE.Mesh(
+    new THREE.SphereGeometry(0.085, 20, 20),
+    new THREE.MeshStandardMaterial({ color: 0xfff2bf, emissive: 0xffe3a0, emissiveIntensity: 0.55 })
+  );
+  lamp.position.set(0.55, 1.02, -1.65);
+  room.add(lamp);
+}
+
+buildRoom();
+
+// ---------------- Avatar (VRM) ----------------
+const vrmLoader = new GLTFLoader();
+vrmLoader.register((parser) => new VRMLoaderPlugin(parser, { autoUpdateHumanBones: true }));
+
+let vrm = null;
+let avatarRoot = null;
+let bones = {};
+
+function toStandardMaterials(obj){
+  obj.traverse((n) => {
+    if (!n.isMesh) return;
+    const mats = Array.isArray(n.material) ? n.material : [n.material];
+    const newMats = mats.map((m) => {
+      const std = new THREE.MeshStandardMaterial({
+        color: (m.color ? m.color.clone() : new THREE.Color(0xffffff)),
+        map: m.map || null,
+        emissive: m.emissive ? m.emissive.clone() : new THREE.Color(0x000000),
+        emissiveMap: m.emissiveMap || null,
+        transparent: !!m.transparent,
+        opacity: (typeof m.opacity === 'number') ? m.opacity : 1,
+        side: m.side,
+        roughness: 0.88,
+        metalness: 0.0
+      });
+      std.alphaTest = m.alphaTest || 0;
+      std.depthWrite = m.depthWrite;
+      return std;
+    });
+    n.material = Array.isArray(n.material) ? newMats : newMats[0];
+  });
+}
+
+function setExpression(name, v){
+  if (!vrm?.expressionManager) return;
+  try{ vrm.expressionManager.setValue(name, v); }catch{ /* ignore */ }
+}
+
+function pickFirstAvailable(names){
+  const em = vrm?.expressionManager;
+  if (!em) return null;
+  for (const n of names){
+    if (em.getExpressionTrackName?.(n) || em.getValue?.(n) !== undefined){
+      return n;
     }
-    return;
+  }
+  // Some builds expose expressionMap
+  const keys = (em.expressionMap && Object.keys(em.expressionMap)) || [];
+  for (const n of names){
+    if (keys.includes(n)) return n;
+  }
+  return null;
+}
+
+let exprBlink = null;
+let exprHappy = null;
+let exprSad = null;
+let exprAngry = null;
+let exprVowels = { a:null, i:null, u:null, e:null, o:null };
+
+function detectExpressions(){
+  exprBlink = pickFirstAvailable(['blink', 'Blink']);
+  exprHappy = pickFirstAvailable(['happy', 'joy', 'Fun', 'smile']);
+  exprSad = pickFirstAvailable(['sad', 'Sorrow']);
+  exprAngry = pickFirstAvailable(['angry', 'Angry']);
+
+  // Mouth shapes differ by model
+  const a = pickFirstAvailable(['aa','A']);
+  const i = pickFirstAvailable(['ih','I']);
+  const u = pickFirstAvailable(['ou','U']);
+  const e = pickFirstAvailable(['ee','E']);
+  const o = pickFirstAvailable(['oh','O']);
+  exprVowels = { a,i,u,e,o };
+}
+
+async function loadAvatar(){
+  return new Promise((resolve) => {
+    const timeout = setTimeout(() => {
+      setLoadingText('로딩이 조금 오래 걸려요…', '모바일은 네트워크/메모리 상태에 따라 시간이 더 걸릴 수 있어요.');
+    }, 8000);
+
+    const onProgress = (xhr) => {
+      if (!xhr?.total) return;
+      const p = Math.round((xhr.loaded / xhr.total) * 100);
+      setLoadingText('아바타 로딩중…', `${p}%`);
+    };
+
+    vrmLoader.load('assets/avatar.vrm', (gltf) => {
+      clearTimeout(timeout);
+      const loaded = gltf.userData.vrm;
+      if (!loaded){
+        resolve(false);
+        return;
+      }
+
+      vrm = loaded;
+
+      // VRM0 -> Three.js axis, etc.
+      VRMUtils.rotateVRM0(vrm);
+
+      avatarRoot = vrm.scene;
+      avatarRoot.position.set(0.2, 0, -0.25);
+      avatarRoot.rotation.y = Math.PI * 0.15;
+      scene.add(avatarRoot);
+
+      // 모바일 안정성: MToon 셰이더 대신 표준 머티리얼로 변환
+      toStandardMaterials(avatarRoot);
+
+      // Remove unnecessary stuff to speed up
+      try{ VRMUtils.removeUnnecessaryJoints(avatarRoot); }catch{}
+
+      // Cache bone refs
+      const h = vrm.humanoid;
+      bones = {
+        head: h.getRawBoneNode(VRMHumanBoneName.Head),
+        neck: h.getRawBoneNode(VRMHumanBoneName.Neck),
+        chest: h.getRawBoneNode(VRMHumanBoneName.Chest),
+        spine: h.getRawBoneNode(VRMHumanBoneName.Spine),
+        hips: h.getRawBoneNode(VRMHumanBoneName.Hips),
+        rUpperArm: h.getRawBoneNode(VRMHumanBoneName.RightUpperArm),
+        rLowerArm: h.getRawBoneNode(VRMHumanBoneName.RightLowerArm),
+        rHand: h.getRawBoneNode(VRMHumanBoneName.RightHand),
+        lUpperArm: h.getRawBoneNode(VRMHumanBoneName.LeftUpperArm),
+        lLowerArm: h.getRawBoneNode(VRMHumanBoneName.LeftLowerArm),
+        lHand: h.getRawBoneNode(VRMHumanBoneName.LeftHand)
+      };
+
+      detectExpressions();
+
+      // Calm base pose
+      applyUpperBodyPose(0, { kind:'idle', wave:0, happy:0, sad:0, angry:0, talk:0 }, 1);
+      resolve(true);
+    }, onProgress, (err) => {
+      clearTimeout(timeout);
+      console.error('VRM load failed', err);
+      resolve(false);
+    });
+  });
+}
+
+// ---------------- Procedural animation ----------------
+const clock = new THREE.Clock();
+
+let blinkTimer = rand(2.2, 4.2);
+let blinkPhase = 0;
+let mouth = 0;
+
+// Wandering around the diorama
+const wander = {
+  active: true,
+  pointIndex: 0,
+  nextSwitchAt: 0,
+  points: [
+    new THREE.Vector3(0.4, 0, -0.4),
+    new THREE.Vector3(1.15, 0, -0.9),
+    new THREE.Vector3(0.2, 0, 0.25),
+    new THREE.Vector3(0.95, 0, 0.15)
+  ]
+};
+
+function stopWanderFor(seconds){
+  wander.active = false;
+  const resumeAt = clock.elapsedTime + seconds;
+  const check = () => {
+    if (clock.elapsedTime >= resumeAt){
+      wander.active = true;
+    } else {
+      requestAnimationFrame(check);
+    }
+  };
+  requestAnimationFrame(check);
+}
+
+function faceCameraYaw(dt){
+  if (!avatarRoot) return;
+  const p = new THREE.Vector3();
+  avatarRoot.getWorldPosition(p);
+  const toCam = new THREE.Vector3().subVectors(camera.position, p);
+  toCam.y = 0;
+  if (toCam.lengthSq() < 1e-6) return;
+  toCam.normalize();
+  const targetYaw = Math.atan2(toCam.x, toCam.z);
+  avatarRoot.rotation.y = THREE.MathUtils.lerpAngle(avatarRoot.rotation.y, targetYaw, 1 - Math.exp(-dt * 7));
+}
+
+function lookAtCameraHead(dt){
+  if (!bones.head || !avatarRoot) return;
+  const headPos = new THREE.Vector3();
+  bones.head.getWorldPosition(headPos);
+  const toCam = new THREE.Vector3().subVectors(camera.position, headPos);
+
+  // Convert to avatar local space
+  const inv = new THREE.Matrix4().copy(avatarRoot.matrixWorld).invert();
+  toCam.applyMatrix4(inv);
+  // Limit angles
+  const yaw = Math.atan2(toCam.x, toCam.z);
+  const pitch = Math.atan2(-toCam.y, Math.sqrt(toCam.x*toCam.x + toCam.z*toCam.z));
+  const yawLim = THREE.MathUtils.clamp(yaw, -0.45, 0.45);
+  const pitchLim = THREE.MathUtils.clamp(pitch, -0.25, 0.35);
+
+  const targetQ = new THREE.Quaternion().setFromEuler(new THREE.Euler(pitchLim, yawLim * 0.7, 0, 'YXZ'));
+  bones.head.quaternion.slerp(targetQ, 1 - Math.exp(-dt * 6));
+}
+
+// Base pose (hands together, calm)
+const BASE = {
+  rUpperArm: new THREE.Euler(0.18, -0.35, 0.40),
+  rLowerArm: new THREE.Euler(-0.25, 0.06, 0.10),
+  rHand: new THREE.Euler(0.00, 0.00, 0.00),
+  lUpperArm: new THREE.Euler(0.18, 0.35, -0.40),
+  lLowerArm: new THREE.Euler(-0.25, -0.06, -0.10),
+  lHand: new THREE.Euler(0.00, 0.00, 0.00),
+  chest: new THREE.Euler(0.00, 0.00, 0.00)
+};
+
+function slerpToEuler(bone, euler, alpha){
+  if (!bone) return;
+  const q = new THREE.Quaternion().setFromEuler(euler);
+  bone.quaternion.slerp(q, alpha);
+}
+
+function applyUpperBodyPose(dt, state, alpha){
+  // state: {kind, wave, happy, sad, angry, talk}
+  const a = alpha ?? (1 - Math.exp(-dt * 10));
+
+  const wave = state.wave || 0;
+  const happy = state.happy || 0;
+  const sad = state.sad || 0;
+  const angry = state.angry || 0;
+  const talk = state.talk || 0;
+
+  // Chest breathing + mild nod
+  const breathe = Math.sin(clock.elapsedTime * 1.6) * 0.012;
+  const nod = talk ? Math.sin(clock.elapsedTime * 2.8) * 0.04 * talk : 0;
+  const chestEuler = new THREE.Euler(
+    BASE.chest.x + breathe + sad*0.10 - angry*0.03,
+    0,
+    0
+  );
+  slerpToEuler(bones.chest, chestEuler, a);
+
+  // Arms: calm by default, wave uses right arm
+  const rUA = new THREE.Euler(
+    BASE.rUpperArm.x - 0.08*happy + 0.05*sad,
+    BASE.rUpperArm.y,
+    BASE.rUpperArm.z
+  );
+  const rLA = new THREE.Euler(
+    BASE.rLowerArm.x,
+    BASE.rLowerArm.y,
+    BASE.rLowerArm.z
+  );
+
+  // Greeting wave (override right arm)
+  if (wave > 0){
+    rUA.set(-0.30, -0.55, 0.85);
+    rLA.set(-0.85, 0.18, 0.20);
   }
 
-  blinkCooldown -= dt;
-  if (blinkCooldown <= 0) {
-    blinkPhase = 0.0001;
+  slerpToEuler(bones.rUpperArm, rUA, a);
+  slerpToEuler(bones.rLowerArm, rLA, a);
+
+  if (bones.rHand){
+    const wig = wave > 0 ? Math.sin(clock.elapsedTime * 10) * 0.35 * wave : 0;
+    slerpToEuler(bones.rHand, new THREE.Euler(0,0,wig), a * 0.7);
+  }
+
+  const lUA = new THREE.Euler(
+    BASE.lUpperArm.x - 0.08*happy + 0.05*sad,
+    BASE.lUpperArm.y,
+    BASE.lUpperArm.z
+  );
+  const lLA = new THREE.Euler(BASE.lLowerArm.x, BASE.lLowerArm.y, BASE.lLowerArm.z);
+  slerpToEuler(bones.lUpperArm, lUA, a);
+  slerpToEuler(bones.lLowerArm, lLA, a);
+  slerpToEuler(bones.lHand, BASE.lHand, a);
+
+  // Head nod add (keep small, head lookAt handles most)
+  if (bones.neck && nod){
+    const q = new THREE.Quaternion().setFromEuler(new THREE.Euler(nod, 0, 0));
+    bones.neck.quaternion.slerp(q, 0.15);
   }
 }
 
-function tick(now) {
-  const dt = (now - last) / 1000;
-  last = now;
+// Gesture system
+let gesture = { type:'none', t:0, dur:0 };
+function startGesture(type, dur){ gesture = { type, t:0, dur }; }
 
-  resize();
-  controls.update();
+function gestureWeights(){
+  if (gesture.type === 'none' || gesture.dur <= 0) return { wave:0, happy:0, sad:0, angry:0 };
+  const t = clamp01(gesture.t / gesture.dur);
+  const k = easeInOut(t);
+  if (gesture.type === 'wave') return { wave:k, happy:0, sad:0, angry:0 };
+  if (gesture.type === 'happy') return { wave:0, happy:k, sad:0, angry:0 };
+  if (gesture.type === 'sad') return { wave:0, happy:0, sad:k, angry:0 };
+  if (gesture.type === 'angry') return { wave:0, happy:0, sad:0, angry:k };
+  return { wave:0, happy:0, sad:0, angry:0 };
+}
 
-  if (currentVrm) {
-    // Animations
-    mixer?.update(dt);
-    currentVrm.update(dt);
-
-    // Blink
-    updateBlink(dt);
-
-    // Lip sync (very rough): decay the pulse, and occasionally pulse while speaking.
-    if (speaking && mouthPulse < 0.15 && Math.random() < dt * 10) pulseMouth();
-    mouthPulse = Math.max(0, mouthPulse - dt * 5.5);
-    setMouthShape(mouthShape, mouthPulse * 0.85);
+function updateGesture(dt){
+  if (gesture.type === 'none') return;
+  gesture.t += dt;
+  if (gesture.t >= gesture.dur){
+    gesture.type = 'none';
   }
-
-  renderer.render(scene, camera);
-  requestAnimationFrame(tick);
 }
 
-await loadVrm();
-
-// Seed a few random greeting lines so you can immediately see reactions.
-{
-  const greet = pick([
-    '안녕~ 오늘도 만나서 반가워! 😊',
-    '하이하이! 교실에 놀러왔어? ✨',
-    '안뇽! 뭐 얘기해볼까? 😳',
-  ]);
-  addMessage('bot', greet);
-  // Don't auto-speak immediately (some people hate autoplay). Click Send to hear.
-  addMessage('bot', '예시: "안녕" / "오늘 뭐해?" / "ㅋㅋ" / "피곤해" 같은 말도 좋아!');
-  triggerReactionForText(greet, { isBot: true });
+function updateBlink(dt){
+  if (!exprBlink) return;
+  blinkTimer -= dt;
+  if (blinkTimer <= 0){
+    blinkTimer = rand(2.0, 4.0);
+    blinkPhase = 0.12;
+  }
+  if (blinkPhase > 0){
+    blinkPhase -= dt;
+    const p = 1 - clamp01(blinkPhase / 0.12);
+    const b = Math.sin(p * Math.PI);
+    setExpression(exprBlink, b);
+  } else {
+    setExpression(exprBlink, 0);
+  }
 }
-requestAnimationFrame(tick);
 
-// ---------------------------
-// Chat flow
-// ---------------------------
-form.addEventListener('submit', (e) => {
-  e.preventDefault();
-  const text = msgInput.value.trim();
-  if (!text) return;
-  msgInput.value = '';
+function setAllVowelsZero(){
+  for (const k of Object.keys(exprVowels)){
+    if (exprVowels[k]) setExpression(exprVowels[k], 0);
+  }
+}
 
-  addMessage('user', text);
-  // A small acknowledgement gesture when you talk to her.
-  triggerReactionForText(text, { isBot: false });
-  const reply = makeReply(text);
+function updateMouth(dt){
+  const target = speaking ? 0.55 + 0.25 * Math.sin(performance.now() * 0.016) : 0;
+  mouth = THREE.MathUtils.lerp(mouth, target, 1 - Math.exp(-dt * 10));
 
-  // Give a tiny delay for “chat-like” feel
-  setTimeout(() => {
-    addMessage('bot', reply);
-    speak(reply);
-  }, 250);
+  setAllVowelsZero();
+  if (!speaking) return;
+
+  const seq = ['a','i','u','e','o'];
+  const idx = Math.floor((performance.now() / 110) % seq.length);
+  const key = seq[idx];
+  const expr = exprVowels[key] || exprVowels.a;
+  if (expr) setExpression(expr, mouth);
+}
+
+function updateWander(dt){
+  if (!avatarRoot || !wander.active || speaking || gesture.type !== 'none') return;
+
+  const now = clock.elapsedTime;
+  if (now > wander.nextSwitchAt){
+    wander.nextSwitchAt = now + rand(3.5, 6.0);
+    wander.pointIndex = (wander.pointIndex + 1) % wander.points.length;
+  }
+  const target = wander.points[wander.pointIndex];
+
+  const pos = avatarRoot.position;
+  const dir = new THREE.Vector3().subVectors(target, pos);
+  dir.y = 0;
+  const dist = dir.length();
+  if (dist > 0.03){
+    dir.normalize();
+    const speed = 0.16;
+    pos.addScaledVector(dir, Math.min(dist, speed * dt));
+
+    const yaw = Math.atan2(dir.x, dir.z);
+    avatarRoot.rotation.y = THREE.MathUtils.lerpAngle(avatarRoot.rotation.y, yaw, 1 - Math.exp(-dt * 4));
+
+    // tiny step bob (very subtle)
+    const bob = Math.sin(now * 6.0) * 0.006;
+    avatarRoot.position.y = bob;
+  }
+}
+
+// ---------------- Chat logic ----------------
+const RESPONSES = {
+  greet: [
+    '안녕! 오늘도 반가워 😊',
+    '하이~ 여기 있었구나!',
+    '안녕하세요! 오늘 어떤 얘기 해볼까?'
+  ],
+  happy: [
+    '와, 그거 너무 좋다! 나도 덩달아 기분 좋아졌어 ✨',
+    '헤헤, 신난다! 같이 축하하자!',
+    '오늘은 행복이 뿜뿜이네~ 무슨 일 있었어?'
+  ],
+  sad: [
+    '괜찮아… 천천히 말해도 돼. 내가 들어줄게.',
+    '마음이 무거웠구나. 여기서는 편하게 쉬어가자.',
+    '토닥토닥… 지금 제일 힘든 게 뭐야?'
+  ],
+  angry: [
+    '으응… 화날 만했겠다. 같이 정리해보자!',
+    '그럴 땐 숨 크게 한 번! 후—',
+    '너무 참지 말고 말해줘. 무슨 일이야?'
+  ],
+  thanks: [
+    '에헤헤~ 고마워! 나도 도움이 되고 싶었어.',
+    '별말을~ 여기 있는 동안은 내가 편이야!',
+    '고마워라… 오늘 좋은 일 생길 거야 ✨'
+  ],
+  sorry: [
+    '괜찮아! 우리 천천히 다시 해보자.',
+    '미안해하지 마~ 누구나 그럴 수 있어.',
+    '응응, 이해했어. 다음엔 더 편하게 말해줘!'
+  ],
+  sleepy: [
+    '졸리면 잠깐 스트레칭! 같이 숨 크게~',
+    '오늘 많이 피곤했구나. 물 한 잔 마실래?',
+    '조금만 쉬었다가 다시 돌아오자. 내가 기다릴게!'
+  ],
+  normal: [
+    '오케이! 좀 더 자세히 말해줄래?',
+    '음~ 그런 느낌이구나. 그 다음은?',
+    '좋아, 계속 이야기해보자!'
+  ]
+};
+
+function pick(arr){ return arr[Math.floor(Math.random()*arr.length)]; }
+
+function classify(text){
+  const t = text.trim().toLowerCase();
+  const has = (...keys) => keys.some(k => t.includes(k));
+
+  if (has('인사','안녕','하이','hello','hi')) return 'greet';
+  if (has('기쁨','행복','좋아','신나','축하','최고')) return 'happy';
+  if (has('슬픔','우울','눈물','힘들','속상')) return 'sad';
+  if (has('화남','짜증','분노','열받','빡쳐')) return 'angry';
+  if (has('고마','감사','thanks','thx')) return 'thanks';
+  if (has('미안','sorry','죄송')) return 'sorry';
+  if (has('졸려','피곤','잠','sleepy')) return 'sleepy';
+  return 'normal';
+}
+
+function reactTo(kind){
+  stopWanderFor(2.8);
+
+  const reply = pick(RESPONSES[kind] || RESPONSES.normal);
+  addBubble('VTuber', reply);
+  speak(reply);
+
+  // Motion
+  if (kind === 'greet') startGesture('wave', 1.2);
+  else if (kind === 'happy') startGesture('happy', 1.4);
+  else if (kind === 'sad') startGesture('sad', 1.7);
+  else if (kind === 'angry') startGesture('angry', 1.2);
+  else startGesture('happy', 0.9);
+
+  // Face expression (if available)
+  if (kind === 'happy' && exprHappy){ setExpression(exprHappy, 0.9); setTimeout(() => setExpression(exprHappy, 0), 900); }
+  if (kind === 'sad' && exprSad){ setExpression(exprSad, 0.9); setTimeout(() => setExpression(exprSad, 0), 1200); }
+  if (kind === 'angry' && exprAngry){ setExpression(exprAngry, 0.8); setTimeout(() => setExpression(exprAngry, 0), 1000); }
+}
+
+function handleSend(){
+  const text = elText.value;
+  elText.value = '';
+  const trimmed = text.trim();
+  if (!trimmed) return;
+  addBubble('You', trimmed, true);
+  reactTo(classify(trimmed));
+}
+
+elSend.addEventListener('click', handleSend);
+elText.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') handleSend();
 });
+
+// ---------------- Main loop ----------------
+(async () => {
+  onResize();
+
+  addBubble('VTuber', '교실에 어서 와! 메시지를 보내면 내가 보고, 대답하고, 살짝 리액션도 해줄게 😊');
+  addBubble('VTuber', '예: "인사" / "기쁨" / "슬픔" / "화남" / "고마워" / "졸려"');
+  if (!ttsEnabled) addBubble('시스템', '모바일은 소리 재생을 위해 오른쪽 위의 “음성 켜기”를 한 번 눌러줘!');
+
+  setLoadingText('아바타 로딩중…', '모바일은 처음 한 번만 조금 더 걸릴 수 있어요.');
+  const ok = await loadAvatar();
+  if (elLoading) elLoading.style.display = 'none';
+
+  if (!ok){
+    addBubble('시스템', '아바타 로딩에 실패했어요. 모바일이면: 데이터 절약 모드/저전력 모드 해제 후 다시 시도해보세요.');
+    addBubble('시스템', '그래도 안 되면 다른 브라우저(Chrome/Edge/Safari)에서 열어봐줘!');
+  } else {
+    addBubble('VTuber', '로딩 완료! 이제 얘기해보자~');
+  }
+
+  function tick(){
+    const dt = Math.min(0.033, clock.getDelta());
+
+    controls.update();
+
+    if (vrm) vrm.update(dt);
+
+    // Wander or engage
+    if (speaking || gesture.type !== 'none'){
+      faceCameraYaw(dt);
+      lookAtCameraHead(dt);
+    } else {
+      updateWander(dt);
+      // soft casual gaze
+      lookAtCameraHead(dt * 0.35);
+    }
+
+    // Gestures / pose
+    updateGesture(dt);
+    const w = gestureWeights();
+    const talk = speaking ? 1 : 0;
+    applyUpperBodyPose(dt, { kind:'idle', talk, ...w }, 1 - Math.exp(-dt * 9));
+
+    // Happy bounce (subtle)
+    if (avatarRoot){
+      if (gesture.type === 'happy'){
+        avatarRoot.position.y = 0.01 + Math.sin(clock.elapsedTime * 9.0) * 0.012;
+      } else if (!wander.active){
+        avatarRoot.position.y = 0;
+      }
+    }
+
+    updateBlink(dt);
+    updateMouth(dt);
+
+    renderer.render(scene, camera);
+    requestAnimationFrame(tick);
+  }
+
+  requestAnimationFrame(tick);
+})();

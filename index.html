@@ -2,68 +2,45 @@
 <html lang="ko">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>VTuber Chat (Three.js)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <title>VTuber Chat (Room)</title>
   <link rel="stylesheet" href="styles.css" />
+
+  <!-- Pure static site (GitHub Pages OK): use CDN ESM via importmap -->
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+      "three/examples/jsm/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
+      "@pixiv/three-vrm": "https://cdn.jsdelivr.net/npm/@pixiv/three-vrm@3.4.5/lib/three-vrm.module.min.js"
+    }
+  }
+  </script>
 </head>
 <body>
-  <header>
-    <div class="title">
-      <h1>VTuber Chat Demo</h1>
-      <p class="sub">Three.js + VRM + VRMA Animation + Web Speech API (브라우저 내장 TTS)</p>
-    </div>
-    <div class="controls">
-      <label>
-        Pitch
-        <input id="pitch" type="range" min="0.5" max="2" step="0.05" value="1.25" />
-      </label>
-      <label>
-        Rate
-        <input id="rate" type="range" min="0.5" max="2" step="0.05" value="1.1" />
-      </label>
-      <button id="stopBtn" title="Stop speaking">Stop</button>
-    </div>
-  </header>
+  <div id="app">
+    <div id="stageWrap">
+      <canvas id="stage"></canvas>
 
-  <main>
-    <section class="stage">
-      <canvas id="c"></canvas>
-      <div class="hint">
-        드래그: 회전 · 휠: 줌 · 우클릭 드래그: 이동
+      <div id="loading" class="overlay">
+        <div class="card">
+          <div class="spinner"></div>
+          <div class="title">아바타/교실 로딩중…</div>
+          <div class="desc">모바일은 처음 한 번만 조금 더 걸릴 수 있어요.</div>
+        </div>
       </div>
-    </section>
 
-    <section class="chat">
-      <div id="log" class="log" aria-live="polite"></div>
-      <form id="form" class="composer">
-        <input id="msg" type="text" placeholder="메시지를 입력하고 Enter…" autocomplete="off" />
-        <button type="submit">Send</button>
-      </form>
-      <div class="note">
-        <strong>참고:</strong> 이 데모는 OS/브라우저가 제공하는 목소리를 사용합니다.
-        “보이스 파일(모델) + 추론 엔진”을 함께 내장한 완전 오프라인/고정 목소리 버전은 용량이 커져서
-        GitHub Pages에서도 가능하긴 하지만(ONNX/WASM 기반), 별도 모델 파일을 포함해야 합니다.
+      <button id="audioGate" class="overlayBtn" type="button">🔊 음성 켜기</button>
+    </div>
+
+    <div id="chat">
+      <div id="messages" aria-live="polite"></div>
+      <div id="composer">
+        <input id="text" type="text" placeholder="메시지를 입력하고 Enter… (예: 인사 / 기쁨 / 슬픔 / 화남 / 고마워)" autocomplete="off" />
+        <button id="send" type="button">Send</button>
       </div>
-    </section>
-  </main>
-
-  <footer>
-    <span>Avatar: VRoid Studio sample model (CC0) · Motions: VRMA samples (MIT) · Background: free classroom photo</span>
-  </footer>
-
-  <!--
-    IMPORTANT (GitHub Pages fix):
-    Some ESM packages (e.g. three-vrm) import "three" as a *bare specifier*.
-    Browsers need an import map to resolve that.
-  -->
-  <script type="importmap">
-    {
-      "imports": {
-        "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
-        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
-      }
-    }
-  </script>
+    </div>
+  </div>
 
   <script type="module" src="app.js"></script>
 </body>

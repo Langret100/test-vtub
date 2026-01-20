@@ -1,0 +1,12 @@
+This demo bundles third‑party assets under the following licenses:
+
+1) VRM avatar file (assets/avatar.vrm)
+   - "Base Female" (VRoid Studio CC0 Models)
+   - License: CC0 1.0 Universal (Public Domain)
+   - Source: https://opengameart.org/content/vroid-studio-cc0-models
+
+2) Libraries
+   - three.js (MIT)
+   - @pixiv/three-vrm (MIT)
+
+No warranty.
