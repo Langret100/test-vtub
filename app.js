@@ -390,6 +390,7 @@ let vrm = null;
 let avatarRoot = null;
 let bones = {};
 let fallback = null;
+let baseLook = { head: null, neck: null, chest: null };
 
 function toStandardMaterials(obj){
   obj.traverse((n) => {
@@ -509,31 +510,38 @@ async function loadAvatar(){
 
       // Remove unnecessary stuff to speed up
       try{ VRMUtils.removeUnnecessaryJoints(avatarRoot); }catch{}
-
-      // Cache bone refs
+      // Cache bone refs (prefer normalized bones for posing; fallback to raw if needed)
       const h = vrm.humanoid;
+      const getBone = (name) => (h.getNormalizedBoneNode?.(name) || h.getRawBoneNode?.(name) || null);
       bones = {
-        head: h.getRawBoneNode(VRMHumanBoneName.Head),
-        neck: h.getRawBoneNode(VRMHumanBoneName.Neck),
-        chest: h.getRawBoneNode(VRMHumanBoneName.Chest),
-        spine: h.getRawBoneNode(VRMHumanBoneName.Spine),
-        hips: h.getRawBoneNode(VRMHumanBoneName.Hips),
-        rUpperArm: h.getRawBoneNode(VRMHumanBoneName.RightUpperArm),
-        rLowerArm: h.getRawBoneNode(VRMHumanBoneName.RightLowerArm),
-        rHand: h.getRawBoneNode(VRMHumanBoneName.RightHand),
-        lUpperArm: h.getRawBoneNode(VRMHumanBoneName.LeftUpperArm),
-        lLowerArm: h.getRawBoneNode(VRMHumanBoneName.LeftLowerArm),
-        lHand: h.getRawBoneNode(VRMHumanBoneName.LeftHand),
-        // legs for a more natural walk cycle
-        rUpperLeg: h.getRawBoneNode(VRMHumanBoneName.RightUpperLeg),
-        rLowerLeg: h.getRawBoneNode(VRMHumanBoneName.RightLowerLeg),
-        rFoot: h.getRawBoneNode(VRMHumanBoneName.RightFoot),
-        lUpperLeg: h.getRawBoneNode(VRMHumanBoneName.LeftUpperLeg),
-        lLowerLeg: h.getRawBoneNode(VRMHumanBoneName.LeftLowerLeg),
-        lFoot: h.getRawBoneNode(VRMHumanBoneName.LeftFoot)
+        head: getBone(VRMHumanBoneName.Head),
+        neck: getBone(VRMHumanBoneName.Neck),
+        chest: getBone(VRMHumanBoneName.Chest),
+        spine: getBone(VRMHumanBoneName.Spine),
+        hips: getBone(VRMHumanBoneName.Hips),
+        rUpperArm: getBone(VRMHumanBoneName.RightUpperArm),
+        rLowerArm: getBone(VRMHumanBoneName.RightLowerArm),
+        rHand: getBone(VRMHumanBoneName.RightHand),
+        lUpperArm: getBone(VRMHumanBoneName.LeftUpperArm),
+        lLowerArm: getBone(VRMHumanBoneName.LeftLowerArm),
+        lHand: getBone(VRMHumanBoneName.LeftHand),
+        // legs
+        rUpperLeg: getBone(VRMHumanBoneName.RightUpperLeg),
+        rLowerLeg: getBone(VRMHumanBoneName.RightLowerLeg),
+        rFoot: getBone(VRMHumanBoneName.RightFoot),
+        lUpperLeg: getBone(VRMHumanBoneName.LeftUpperLeg),
+        lLowerLeg: getBone(VRMHumanBoneName.LeftLowerLeg),
+        lFoot: getBone(VRMHumanBoneName.LeftFoot)
       };
 
       detectExpressions();
+
+      // Cache base local rotations for look-at offsets
+      baseLook = {
+        head: bones.head?.quaternion?.clone?.() || null,
+        neck: bones.neck?.quaternion?.clone?.() || null,
+        chest: bones.chest?.quaternion?.clone?.() || null
+      };
 
       // Calm base pose
       applyUpperBodyPose(0, { kind:'idle', wave:0, happy:0, sad:0, angry:0, talk:0 }, 1);
@@ -616,57 +624,203 @@ const wander = {
   ]
 };
 
-function stopWanderFor(seconds){
-  wander.active = false;
-  const resumeAt = clock.elapsedTime + seconds;
-  const check = () => {
-    if (clock.elapsedTime >= resumeAt){
-      wander.active = true;
-    } else {
-      requestAnimationFrame(check);
-    }
-  };
-  requestAnimationFrame(check);
+function actor(){
+  return avatarRoot || fallback;
 }
 
-function faceCameraYaw(dt){
-  if (!avatarRoot) return;
-  const p = new THREE.Vector3();
-  avatarRoot.getWorldPosition(p);
-  const toCam = new THREE.Vector3().subVectors(camera.position, p);
+const interaction = {
+  mode: 'wander', // 'wander' | 'approach' | 'respond'
+  attentionUntil: 0,
+  approachTarget: null,
+  approachUntil: 0,
+  respondUntil: 0
+};
+
+function requestAttention(seconds=5){
+  interaction.attentionUntil = Math.max(interaction.attentionUntil, clock.elapsedTime + seconds);
+}
+
+function startApproachToUser(seconds=6){
+  const root = actor();
+  if (!root) return;
+  requestAttention(seconds);
+  interaction.mode = 'approach';
+  interaction.respondUntil = 0;
+
+  // Approach a spot closer to the camera (projected to the floor), but keep inside the diorama bounds
+  const pos = root.position.clone();
+  const toCam = new THREE.Vector3().subVectors(camera.position, pos);
   toCam.y = 0;
-  if (toCam.lengthSq() < 1e-6) return;
-  toCam.normalize();
-  const targetYaw = Math.atan2(toCam.x, toCam.z);
-  avatarRoot.rotation.y = lerpAngle(avatarRoot.rotation.y, targetYaw, 1 - Math.exp(-dt * 7));
+  if (toCam.lengthSq() < 1e-6){
+    interaction.mode = 'respond';
+    interaction.respondUntil = clock.elapsedTime + 2.4;
+    return;
+  }
+  const dir = toCam.clone().normalize();
+  const stopDist = 1.85;
+  const target = new THREE.Vector3(camera.position.x, 0, camera.position.z).addScaledVector(dir, -stopDist);
+  target.x = THREE.MathUtils.clamp(target.x, -2.0, 2.0);
+  target.z = THREE.MathUtils.clamp(target.z, -2.0, 2.0);
+
+  interaction.approachTarget = target;
+  interaction.approachUntil = clock.elapsedTime + 5.0;
 }
 
-function lookAtCameraHead(dt){
-  if (!bones.head || !avatarRoot) return;
+function updateApproach(dt){
+  const root = actor();
+  if (!root || !interaction.approachTarget) return true;
+  const pos = root.position;
+  const target = interaction.approachTarget;
+
+  const dir = new THREE.Vector3().subVectors(target, pos);
+  dir.y = 0;
+  const dist = dir.length();
+
+  if (dist < 0.06 || clock.elapsedTime > interaction.approachUntil){
+    interaction.mode = 'respond';
+    interaction.respondUntil = clock.elapsedTime + 2.6;
+    moveAmount = THREE.MathUtils.lerp(moveAmount, 0, 1 - Math.exp(-dt * 8));
+    return true;
+  }
+
+  dir.normalize();
+  const speed = 0.55;
+  const step = Math.min(dist, speed * dt);
+  pos.addScaledVector(dir, step);
+
+  // Keep inside the diorama floor
+  pos.x = THREE.MathUtils.clamp(pos.x, -2.05, 2.05);
+  pos.z = THREE.MathUtils.clamp(pos.z, -2.05, 2.05);
+
+  const yaw = Math.atan2(dir.x, dir.z);
+  root.rotation.y = lerpAngle(root.rotation.y, yaw, 1 - Math.exp(-dt * 7));
+
+  // subtle bob
+  root.position.y = Math.sin(clock.elapsedTime * 7.2) * 0.003;
+
+  moveAmount = THREE.MathUtils.lerp(moveAmount, 1, 1 - Math.exp(-dt * 6));
+  walkPhase += dt * (7.6 + 5.2 * moveAmount);
+  return false;
+}
+
+function updateInteraction(dt){
+  const root = actor();
+  if (!root) return;
+
+  if (interaction.mode === 'approach'){
+    updateApproach(dt);
+    return;
+  }
+
+  if (interaction.mode === 'respond'){
+    // stand still while responding
+    if (clock.elapsedTime >= interaction.respondUntil){
+      interaction.mode = 'wander';
+    }
+    moveAmount = THREE.MathUtils.lerp(moveAmount, 0, 1 - Math.exp(-dt * 7));
+    return;
+  }
+
+  // wander only when not paying attention
+  const attentive = speaking || gesture.type !== 'none' || clock.elapsedTime < interaction.attentionUntil;
+  if (!attentive){
+    updateWander(dt);
+  } else {
+    moveAmount = THREE.MathUtils.lerp(moveAmount, 0, 1 - Math.exp(-dt * 6));
+  }
+}
+
+function faceCameraYaw(dt, strength=10){
+  const root = actor();
+  if (!root) return;
+
+  const p = new THREE.Vector3();
+  root.getWorldPosition(p);
+
+  // Direction based on camera position (where the viewer is)
+  const dirPos = new THREE.Vector3().subVectors(camera.position, p);
+  dirPos.y = 0;
+  if (dirPos.lengthSq() < 1e-6) return;
+  dirPos.normalize();
+
+  // Direction based on camera forward (what the viewer is facing)
+  const dirView = new THREE.Vector3();
+  camera.getWorldDirection(dirView);
+  dirView.multiplyScalar(-1); // from avatar toward camera view origin
+  dirView.y = 0;
+  if (dirView.lengthSq() > 1e-6) dirView.normalize();
+
+  // Blend: makes "look at the camera" feel stronger when camera is orbiting
+  const dir = dirPos.clone().lerp(dirView, 0.35).normalize();
+
+  const targetYaw = Math.atan2(dir.x, dir.z);
+  root.rotation.y = lerpAngle(root.rotation.y, targetYaw, 1 - Math.exp(-dt * strength));
+}
+
+
+function lookAtCameraUpperBody(dt, strength=1){
+  const root = actor();
+  if (!root) return;
+
+  // Fallback avatar: rotate the head sphere toward camera
+  if (!vrm && fallback?.userData?.head){
+    const head = fallback.userData.head;
+    const worldPos = new THREE.Vector3();
+    head.getWorldPosition(worldPos);
+    const q0 = head.quaternion.clone();
+    head.lookAt(camera.position);
+    const q1 = head.quaternion.clone();
+    head.quaternion.copy(q0).slerp(q1, 1 - Math.exp(-dt * 6 * THREE.MathUtils.clamp(strength,0,1)));
+    return;
+  }
+
+  if (!bones.head || !root) return;
+
   const headPos = new THREE.Vector3();
   bones.head.getWorldPosition(headPos);
   const toCam = new THREE.Vector3().subVectors(camera.position, headPos);
 
   // Convert to avatar local space
-  const inv = new THREE.Matrix4().copy(avatarRoot.matrixWorld).invert();
+  const inv = new THREE.Matrix4().copy(root.matrixWorld).invert();
   toCam.applyMatrix4(inv);
-  // Limit angles
+
   const yaw = Math.atan2(toCam.x, toCam.z);
   const pitch = Math.atan2(-toCam.y, Math.sqrt(toCam.x*toCam.x + toCam.z*toCam.z));
-  const yawLim = THREE.MathUtils.clamp(yaw, -0.45, 0.45);
-  const pitchLim = THREE.MathUtils.clamp(pitch, -0.25, 0.35);
 
-  const targetQ = new THREE.Quaternion().setFromEuler(new THREE.Euler(pitchLim, yawLim * 0.7, 0, 'YXZ'));
-  bones.head.quaternion.slerp(targetQ, 1 - Math.exp(-dt * 6));
+  // Limits (a bit stronger than before, but still natural)
+  const yawLim = THREE.MathUtils.clamp(yaw, -0.95, 0.95) * THREE.MathUtils.clamp(strength, 0, 1);
+  const pitchLim = THREE.MathUtils.clamp(pitch, -0.35, 0.55) * THREE.MathUtils.clamp(strength, 0, 1);
+
+  const aHead = 1 - Math.exp(-dt * 12);
+  const aNeck = 1 - Math.exp(-dt * 11);
+  const aChest = 1 - Math.exp(-dt * 9);
+
+  const apply = (bone, baseQ, p, y, alpha) => {
+    if (!bone || !baseQ) return;
+    const off = new THREE.Quaternion().setFromEuler(new THREE.Euler(p, y, 0, 'YXZ'));
+    const tgt = baseQ.clone().multiply(off);
+    bone.quaternion.slerp(tgt, alpha);
+  };
+
+  // Distribute rotation across chest/neck/head for a clearer 'looking at you' feel
+  apply(bones.chest, baseLook.chest, pitchLim * 0.22, yawLim * 0.35, aChest);
+  apply(bones.neck,  baseLook.neck,  pitchLim * 0.55, yawLim * 0.70, aNeck);
+  apply(bones.head,  baseLook.head,  pitchLim * 0.85, yawLim * 1.00, aHead);
+}
+
+function lookAtCameraHead(dt){
+  // Backward compatibility: keep old name but call new system
+  lookAtCameraUpperBody(dt, 1);
 }
 
 // Base pose (hands together, calm)
 const BASE = {
-  rUpperArm: new THREE.Euler(0.18, -0.35, 0.40),
-  rLowerArm: new THREE.Euler(-0.25, 0.06, 0.10),
+  // Calm idle: hands gently together in front (no T-pose, no arm flapping)
+  rUpperArm: new THREE.Euler(0.35, -0.30, 0.28),
+  rLowerArm: new THREE.Euler(-0.55, 0.10, 0.08),
   rHand: new THREE.Euler(0.00, 0.00, 0.00),
-  lUpperArm: new THREE.Euler(0.18, 0.35, -0.40),
-  lLowerArm: new THREE.Euler(-0.25, -0.06, -0.10),
+  lUpperArm: new THREE.Euler(0.35, 0.30, -0.28),
+  lLowerArm: new THREE.Euler(-0.55, -0.10, -0.08),
   lHand: new THREE.Euler(0.00, 0.00, 0.00),
   chest: new THREE.Euler(0.00, 0.00, 0.00)
 };
@@ -706,7 +860,7 @@ function applyUpperBodyPose(dt, state, alpha){
   slerpToEuler(bones.chest, chestEuler, a);
 
   const sWalk = Math.sin(walkPhase);
-  const swing = 0.10 * walkSwing;
+  const swing = 0.0; // keep hands together even while walking
 
   // Arms: calm by default, small swing when walking, gestures override
   const rUA = new THREE.Euler(
@@ -784,21 +938,36 @@ function applyUpperBodyPose(dt, state, alpha){
 }
 
 // Gesture system
-let gesture = { type:'none', t:0, dur:0 };
-function startGesture(type, dur){ gesture = { type, t:0, dur }; }
+let gesture = { type:'none', t:0, dur:0, intensity:1 };
+function startGesture(type, dur, intensity=1){
+  gesture = { type, t:0, dur, intensity: THREE.MathUtils.clamp(intensity, 0.15, 1.25) };
+}
+
+function env(t, dur, attack=0.18, release=0.28){
+  if (dur <= 0) return 0;
+  const x = clamp01(t / dur);
+  const a = clamp01(attack);
+  const r = clamp01(release);
+  const holdStart = a;
+  const holdEnd = Math.max(holdStart, 1 - r);
+  if (x < holdStart){
+    const u = x / Math.max(1e-6, holdStart);
+    return easeInOut(u);
+  }
+  if (x > holdEnd){
+    const u = (1 - x) / Math.max(1e-6, 1 - holdEnd);
+    return easeInOut(u);
+  }
+  return 1;
+}
 
 function gestureWeights(){
   if (gesture.type === 'none' || gesture.dur <= 0) return { wave:0, happy:0, sad:0, angry:0, surprise:0, shy:0, think:0 };
-  const t = clamp01(gesture.t / gesture.dur);
-  const k = easeInOut(t);
-  if (gesture.type === 'wave') return { wave:k, happy:0, sad:0, angry:0, surprise:0, shy:0, think:0 };
-  if (gesture.type === 'happy') return { wave:0, happy:k, sad:0, angry:0, surprise:0, shy:0, think:0 };
-  if (gesture.type === 'sad') return { wave:0, happy:0, sad:k, angry:0, surprise:0, shy:0, think:0 };
-  if (gesture.type === 'angry') return { wave:0, happy:0, sad:0, angry:k, surprise:0, shy:0, think:0 };
-  if (gesture.type === 'surprise') return { wave:0, happy:0, sad:0, angry:0, surprise:k, shy:0, think:0 };
-  if (gesture.type === 'shy') return { wave:0, happy:0, sad:0, angry:0, surprise:0, shy:k, think:0 };
-  if (gesture.type === 'think') return { wave:0, happy:0, sad:0, angry:0, surprise:0, shy:0, think:k };
-  return { wave:0, happy:0, sad:0, angry:0, surprise:0, shy:0, think:0 };
+  const k = env(gesture.t, gesture.dur) * (gesture.intensity || 1);
+  const z = { wave:0, happy:0, sad:0, angry:0, surprise:0, shy:0, think:0 };
+  if (gesture.type in z) z[gesture.type] = k;
+  if (gesture.type === 'wave') z.wave = k;
+  return z;
 }
 
 function updateGesture(dt){
@@ -927,7 +1096,8 @@ function pickVowelFromPlan(){
 }
 
 function updateWander(dt){
-  if (!avatarRoot || !wander.active || speaking || gesture.type !== 'none') return;
+  const root = actor();
+  if (!root || !wander.active) return;
 
   const now = clock.elapsedTime;
   if (now > wander.nextSwitchAt){
@@ -936,7 +1106,7 @@ function updateWander(dt){
   }
   const target = wander.points[wander.pointIndex];
 
-  const pos = avatarRoot.position;
+  const pos = root.position;
   const dir = new THREE.Vector3().subVectors(target, pos);
   dir.y = 0;
   const dist = dir.length();
@@ -951,11 +1121,11 @@ function updateWander(dt){
     pos.z = THREE.MathUtils.clamp(pos.z, -2.05, 2.05);
 
     const yaw = Math.atan2(dir.x, dir.z);
-    avatarRoot.rotation.y = lerpAngle(avatarRoot.rotation.y, yaw, 1 - Math.exp(-dt * 4));
+    root.rotation.y = lerpAngle(root.rotation.y, yaw, 1 - Math.exp(-dt * 4));
 
     // tiny step bob (subtle)
     const bob = Math.sin(now * 7.2) * 0.004;
-    avatarRoot.position.y = bob;
+    root.position.y = bob;
 
     // movement amount for walk cycle (0..1)
     moveAmount = THREE.MathUtils.lerp(moveAmount, THREE.MathUtils.clamp(step / (speed * dt + 1e-6), 0, 1), 1 - Math.exp(-dt * 10));
@@ -1077,21 +1247,23 @@ function classify(text){
 }
 
 function reactTo(kind){
-  stopWanderFor(2.8);
+  // When user chats: approach, stop, then react (works even if TTS is off)
+  requestAttention(7);
+  startApproachToUser(7);
 
   const reply = pick(RESPONSES[kind] || RESPONSES.normal);
   addBubble('VTuber', reply);
   speak(reply);
 
-  // Motion
-  if (kind === 'greet') startGesture('wave', 1.2);
-  else if (kind === 'happy') startGesture('happy', 1.4);
-  else if (kind === 'sad') startGesture('sad', 1.7);
-  else if (kind === 'angry') startGesture('angry', 1.2);
-  else if (kind === 'surprise') startGesture('surprise', 1.0);
-  else if (kind === 'shy') startGesture('shy', 1.4);
-  else if (kind === 'think') startGesture('think', 1.6);
-  else startGesture('happy', 0.9);
+  // Motion tuning (length + intensity per emotion)
+  if (kind === 'greet') startGesture('wave', 1.55, 1.0);
+  else if (kind === 'happy') startGesture('happy', 2.10, 1.05);
+  else if (kind === 'sad') startGesture('sad', 2.60, 0.95);
+  else if (kind === 'angry') startGesture('angry', 1.85, 1.0);
+  else if (kind === 'surprise') startGesture('surprise', 1.35, 1.05);
+  else if (kind === 'shy') startGesture('shy', 2.05, 0.95);
+  else if (kind === 'think') startGesture('think', 2.40, 0.95);
+  else startGesture('happy', 1.25, 0.70);
 
   // Face expression (if available)
   if (kind === 'happy' && exprHappy){ setExpression(exprHappy, 0.9); setTimeout(() => setExpression(exprHappy, 0), 900); }
@@ -1151,14 +1323,15 @@ elText.addEventListener('keydown', (e) => {
 
     if (vrm) vrm.update(dt);
 
-    // Wander or engage
-    if (speaking || gesture.type !== 'none'){
-      faceCameraYaw(dt);
-      lookAtCameraHead(dt);
+    // Interaction & gaze
+    updateInteraction(dt);
+    const attentive = speaking || gesture.type !== 'none' || clock.elapsedTime < interaction.attentionUntil || interaction.mode !== 'wander';
+    if (attentive){
+      faceCameraYaw(dt, 12);
+      lookAtCameraUpperBody(dt, 1.0);
     } else {
-      updateWander(dt);
       // soft casual gaze
-      lookAtCameraHead(dt * 0.35);
+      lookAtCameraUpperBody(dt, 0.25);
     }
 
     // Gestures / pose
@@ -1170,11 +1343,12 @@ elText.addEventListener('keydown', (e) => {
     applyWalkCycle(dt);
 
     // Happy bounce (subtle)
-    if (avatarRoot){
+    const root = actor();
+    if (root){
       if (gesture.type === 'happy'){
-        avatarRoot.position.y = 0.01 + Math.sin(clock.elapsedTime * 9.0) * 0.012;
-      } else if (!wander.active){
-        avatarRoot.position.y = 0;
+        root.position.y = 0.01 + Math.sin(clock.elapsedTime * 9.0) * 0.012;
+      } else if (interaction.mode !== 'wander'){
+        root.position.y = 0;
       }
     }
 
