@@ -11,6 +11,7 @@ let vrmaMixer = null;
 let vrmaActions = {}; // key -> THREE.AnimationAction
 let vrmaCurrentKey = null;
 let vrmaLoaded = false;
+const IDLE_VRMA_KEY = 'motion7';
 
 // ---------------- UI ----------------
 const elMessages = document.getElementById('messages');
@@ -164,16 +165,16 @@ const canvas = document.getElementById('stage');
 const renderer = new THREE.WebGLRenderer({
   canvas,
   antialias: !isMobile(),
-  alpha: false,
+  alpha: true,
   powerPreference: 'high-performance'
 });
-renderer.setClearColor(0x0b1220, 1);
+renderer.setClearColor(0x000000, 0);
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
-renderer.toneMappingExposure = 1.0;
+renderer.toneMappingExposure = 1.15;
 
 const scene = new THREE.Scene();
-scene.fog = new THREE.Fog(0x0b1220, 6, 18);
+scene.fog = new THREE.Fog(0xf6d9ff, 6, 22);
 
 const camera = new THREE.PerspectiveCamera(35, 1, 0.1, 100);
 camera.position.set(0.0, 1.35, 3.15);
@@ -205,12 +206,69 @@ function onResize(){
 window.addEventListener('resize', onResize);
 window.addEventListener('orientationchange', () => setTimeout(onResize, 200));
 
+// --- Avatar tap: play a random saved motion ---
+const raycaster = new THREE.Raycaster();
+const pointerNDC = new THREE.Vector2();
+let tapStart = null;
+
+function playRandomVRMA(){
+  if (!vrm) return false;
+  if (!vrmaLoaded){
+    // If the motion pack isn't ready yet, load it and then retry once.
+    loadVRMAMotionPack().then(() => {
+      if (vrmaLoaded) playRandomVRMA();
+    });
+    return true;
+  }
+  const keys = Object.keys(vrmaActions).filter((k) => k && k !== IDLE_VRMA_KEY);
+  if (!keys.length) return false;
+  let pick = keys[Math.floor(Math.random() * keys.length)];
+  if (keys.length > 1 && pick === vrmaCurrentKey){
+    pick = keys[(keys.indexOf(pick) + 1) % keys.length];
+  }
+  return playVRMA(pick, { loop: 'once' });
+}
+
+function getPointerNDC(ev){
+  const rect = renderer.domElement.getBoundingClientRect();
+  const x = (ev.clientX - rect.left) / rect.width;
+  const y = (ev.clientY - rect.top) / rect.height;
+  pointerNDC.x = x * 2 - 1;
+  pointerNDC.y = -(y * 2 - 1);
+}
+
+function hitTestAvatar(ev){
+  if (!vrm) return false;
+  getPointerNDC(ev);
+  raycaster.setFromCamera(pointerNDC, camera);
+  const hits = raycaster.intersectObject(vrm.scene, true);
+  return hits && hits.length > 0;
+}
+
+renderer.domElement.addEventListener('pointerdown', (ev) => {
+  if (ev.pointerType === 'mouse' && ev.button !== 0) return;
+  tapStart = { x: ev.clientX, y: ev.clientY, t: performance.now(), id: ev.pointerId };
+});
+renderer.domElement.addEventListener('pointerup', (ev) => {
+  if (!tapStart || ev.pointerId !== tapStart.id) return;
+  const dt = performance.now() - tapStart.t;
+  const dx = ev.clientX - tapStart.x;
+  const dy = ev.clientY - tapStart.y;
+  const dist = Math.hypot(dx, dy);
+  tapStart = null;
+  if (dt > 450 || dist > 8) return; // treat as drag, not tap
+  if (hitTestAvatar(ev)){
+    ev.preventDefault();
+    playRandomVRMA();
+  }
+});
+
 // Lights
-scene.add(new THREE.AmbientLight(0xffffff, 0.55));
-const key = new THREE.DirectionalLight(0xffffff, 1.15);
+scene.add(new THREE.AmbientLight(0xffffff, 0.75));
+const key = new THREE.DirectionalLight(0xffffff, 1.25);
 key.position.set(2.5, 4.0, 2.0);
 scene.add(key);
-const rim = new THREE.DirectionalLight(0xffffff, 0.35);
+const rim = new THREE.DirectionalLight(0xffe6f4, 0.45);
 rim.position.set(-2.5, 2.2, -2.8);
 scene.add(rim);
 
@@ -598,7 +656,12 @@ async function loadVRMAMotionPack(){
 
   // When a VRMA (gesture) ends, fall back to procedural idle
   vrmaMixer.addEventListener('finished', () => {
+    const prev = vrmaCurrentKey;
     vrmaCurrentKey = null;
+    // After one-shot gestures, return to a looping idle (if available)
+    if (prev && prev !== IDLE_VRMA_KEY && vrmaActions[IDLE_VRMA_KEY]){
+      playVRMA(IDLE_VRMA_KEY, { loop: 'repeat', fadeIn: 0.25 });
+    }
   });
 
   const animLoader = new GLTFLoader();

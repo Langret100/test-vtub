@@ -1,17 +1,21 @@
 :root{
-  --bg:#0b1220;
-  --panel:#0f1a2d;
-  --panel2:#0c1628;
-  --text:#e7eefc;
-  --muted:#9bb0d1;
-  --stroke:rgba(255,255,255,0.08);
+  --bg1:#f6d9ff;
+  --bg2:#d6f0ff;
+  --text: rgba(38, 31, 53, 0.90);
+  --muted: rgba(38, 31, 53, 0.62);
+  --panel: rgba(255,255,255,0.72);
+  --panel2: rgba(255,255,255,0.62);
+  --stroke: rgba(41, 20, 68, 0.16);
+  --accent: #9b5de5;
 }
 *{box-sizing:border-box}
 html,body{height:100%}
 body{
   margin:0;
   font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Apple SD Gothic Neo,Noto Sans KR,sans-serif;
-  background:linear-gradient(180deg,#0b1220,#070c16);
+  background: radial-gradient(1200px 800px at 30% 20%, #ffe6f4 0%, transparent 60%),
+              radial-gradient(1000px 700px at 70% 70%, #d7f3ff 0%, transparent 60%),
+              linear-gradient(135deg, var(--bg1), var(--bg2));
   color:var(--text);
 }
 
@@ -43,7 +47,7 @@ body{
   display:flex;
   flex-direction:column;
   min-height:0;
-  background:rgba(255,255,255,0.02);
+  background:rgba(255,255,255,0.30);
 }
 
 #messages{
@@ -58,11 +62,11 @@ body{
   padding:10px 12px;
   border:1px solid var(--stroke);
   border-radius:14px;
-  background:rgba(15,26,45,0.65);
+  background:var(--panel);
   backdrop-filter:blur(10px);
 }
 .bubble .who{font-size:12px;color:var(--muted);margin-bottom:4px}
-.bubble.user{margin-left:auto;background:rgba(30,64,175,0.25)}
+.bubble.user{margin-left:auto;background:rgba(155,93,229,0.22)}
 
 #composer{
   display:flex;
@@ -70,14 +74,14 @@ body{
   padding:10px 12px;
   padding-bottom:calc(10px + env(safe-area-inset-bottom));
   border-top:1px solid var(--stroke);
-  background:rgba(10,16,30,0.6);
+  background:var(--panel2);
   backdrop-filter:blur(10px);
 }
 #text{
   flex:1 1 auto;
   border-radius:12px;
   border:1px solid var(--stroke);
-  background:rgba(255,255,255,0.04);
+  background:rgba(255,255,255,0.45);
   color:var(--text);
   padding:10px 12px;
   outline:none;
@@ -87,7 +91,7 @@ body{
   flex:0 0 auto;
   border-radius:12px;
   border:1px solid var(--stroke);
-  background:rgba(255,255,255,0.06);
+  background:rgba(255,255,255,0.55);
   color:var(--text);
   padding:10px 14px;
 }
@@ -100,7 +104,7 @@ body{
   display:flex;
   align-items:center;
   justify-content:center;
-  background:rgba(3,6,12,0.55);
+  background:rgba(255, 232, 246, 0.45);
 }
 .card{
   display:flex;
@@ -110,7 +114,7 @@ body{
   padding:16px 18px;
   border-radius:16px;
   border:1px solid var(--stroke);
-  background:rgba(15,26,45,0.75);
+  background:rgba(255,255,255,0.80);
   backdrop-filter:blur(10px);
   max-width:280px;
   text-align:center;
@@ -126,7 +130,7 @@ body{
   top:12px;
   border-radius:999px;
   border:1px solid var(--stroke);
-  background:rgba(15,26,45,0.65);
+  background:var(--panel);
   color:var(--text);
   padding:10px 12px;
   backdrop-filter:blur(10px);
