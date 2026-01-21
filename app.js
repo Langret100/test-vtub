@@ -2,6 +2,15 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { VRMLoaderPlugin, VRMUtils, VRMHumanBoneName } from '@pixiv/three-vrm';
+import { VRMAnimationLoaderPlugin, createVRMAnimationClip } from '@pixiv/three-vrm-animation';
+
+// ---------------- VRMA (motion pack) ----------------
+// Loads .vrma files (VRM Animation) and plays them via AnimationMixer.
+// NOTE: The user's VRMA_MotionPack contains only gestures/poses (no locomotion walk).
+let vrmaMixer = null;
+let vrmaActions = {}; // key -> THREE.AnimationAction
+let vrmaCurrentKey = null;
+let vrmaLoaded = false;
 
 // ---------------- UI ----------------
 const elMessages = document.getElementById('messages');
@@ -38,118 +47,6 @@ function lerpAngle(a, b, t){
   const diff = THREE.MathUtils.euclideanModulo((b - a + Math.PI), twoPi) - Math.PI;
   return a + diff * t;
 }
-
-// --- Pose helpers (robust across VRM rest poses) ---
-function slerpToEulerRel(bone, baseQ, eulerOffset, alpha){
-  if (!bone) return;
-  const off = new THREE.Quaternion().setFromEuler(eulerOffset);
-  const tgt = (baseQ ? baseQ.clone().multiply(off) : off);
-  bone.quaternion.slerp(tgt, alpha);
-}
-
-function worldToRootLocal(root, v){
-  const inv = new THREE.Matrix4().copy(root.matrixWorld).invert();
-  return v.clone().applyMatrix4(inv);
-}
-
-// In three.js, Object3D forward is -Z. Use this to compute a yaw that faces an XZ direction.
-function yawFromDirXZ(dir){
-  return Math.atan2(-dir.x, -dir.z) + yawOffset;
-}
-
-// Pick yawOffset (0 or PI) so that yawFromDirXZ points the avatar toward the camera.
-function calibrateYawOffset(){
-  const root = actor();
-  if (!root) return;
-  root.updateMatrixWorld(true);
-  const p = new THREE.Vector3();
-  root.getWorldPosition(p);
-  const toCam = new THREE.Vector3().subVectors(camera.position, p);
-  toCam.y = 0;
-  if (toCam.lengthSq() < 1e-6) return;
-  toCam.normalize();
-
-  const baseYaw = Math.atan2(-toCam.x, -toCam.z);
-
-  const forwardForYaw = (yaw) => new THREE.Vector3(0,0,-1).applyAxisAngle(new THREE.Vector3(0,1,0), yaw);
-  const score = (off) => {
-    const yaw = baseYaw + off;
-    const f = forwardForYaw(yaw);
-    return f.dot(toCam);
-  };
-
-  const s0 = score(0);
-  const s1 = score(Math.PI);
-  yawOffset = (s1 > s0) ? Math.PI : 0;
-}
-
-// Calibrate a safe "arms down" offset once per model by sampling rotations.
-// This prevents T-pose / V-pose across different VRM exporters.
-function calibrateArmsDown(){
-  if (!vrm) return;
-
-  const root = actor();
-  if (!root) return;
-  root.updateMatrixWorld(true);
-
-  const targetR = new THREE.Vector3(0.40, -0.86, 0.10).normalize();
-  const targetL = new THREE.Vector3(-0.40, -0.86, 0.10).normalize();
-
-  const grid = {
-    x: [-2.0,-1.6,-1.2,-0.9,-0.6,-0.3,0.0,0.3],
-    y: [-0.9,-0.6,-0.3,0,0.3,0.6,0.9],
-    z: [-1.8,-1.2,-0.6,0,0.6,1.2,1.8]
-  };
-
-  function bestFor(side){
-    const ua = side === 'r' ? bones.rUpperArm : bones.lUpperArm;
-    const la = side === 'r' ? bones.rLowerArm : bones.lLowerArm;
-    const baseQ = side === 'r' ? basePose.rUpperArm : basePose.lUpperArm;
-    if (!ua || !la || !baseQ) return null;
-
-    const target = side === 'r' ? targetR : targetL;
-
-    const p0 = new THREE.Vector3();
-    const p1 = new THREE.Vector3();
-    const best = { score: 1e9, e: new THREE.Euler(0,0,0,'XYZ') };
-
-    for (const x of grid.x){
-      for (const y of grid.y){
-        for (const z of grid.z){
-          const off = new THREE.Quaternion().setFromEuler(new THREE.Euler(x,y,z,'XYZ'));
-          ua.quaternion.copy(baseQ).multiply(off);
-          vrm.scene.updateMatrixWorld(true);
-
-          ua.getWorldPosition(p0);
-          la.getWorldPosition(p1);
-
-          const a = worldToRootLocal(root, p0);
-          const b = worldToRootLocal(root, p1);
-          const d = b.sub(a).normalize();
-
-          const ang = 1 - d.dot(target); // 0 is best
-          const upPenalty = Math.max(0, d.y + 0.05) * 2.5; // strongly punish arms going up
-          const sidePenalty = Math.max(0, (side==='r' ? -d.x : d.x) + 0.02) * 1.2;
-          const s = ang + upPenalty + sidePenalty;
-
-          if (s < best.score){
-            best.score = s;
-            best.e = new THREE.Euler(x,y,z,'XYZ');
-          }
-        }
-      }
-    }
-
-    // restore
-    ua.quaternion.copy(baseQ);
-    vrm.scene.updateMatrixWorld(true);
-    return best.e;
-  }
-
-  armCalib.r = bestFor('r');
-  armCalib.l = bestFor('l');
-}
-
 
 function isMobile(){
   return matchMedia('(max-width: 879px)').matches || /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
@@ -427,17 +324,19 @@ function buildRoom(){
     room.add(leg);
   });
 
-  // Chair
+  // Chair (place it cleanly in front of the desk; avoid intersection)
+  const chairX = 0.85;
+  const chairZ = -0.95;
   const seat = new THREE.Mesh(new THREE.BoxGeometry(0.55, 0.06, 0.55), new THREE.MeshStandardMaterial({ color: 0x6d7f97, roughness: 0.9 }));
-  seat.position.set(0.35, 0.45, -1.25);
+  seat.position.set(chairX, 0.45, chairZ);
   room.add(seat);
   const back = new THREE.Mesh(new THREE.BoxGeometry(0.55, 0.5, 0.06), new THREE.MeshStandardMaterial({ color: 0x6d7f97, roughness: 0.9 }));
-  back.position.set(0.35, 0.74, -1.5);
+  back.position.set(chairX, 0.74, chairZ - 0.25);
   room.add(back);
   const chairLegGeo = new THREE.BoxGeometry(0.05, 0.45, 0.05);
   [[-0.22,-0.22],[0.22,-0.22],[-0.22,0.22],[0.22,0.22]].forEach(([x,z])=>{
     const leg = new THREE.Mesh(chairLegGeo, legMat);
-    leg.position.set(0.35 + x, 0.225, -1.25 + z);
+    leg.position.set(chairX + x, 0.225, chairZ + z);
     room.add(leg);
   });
 
@@ -504,8 +403,6 @@ let avatarRoot = null;
 let bones = {};
 let fallback = null;
 let baseLook = { head: null, neck: null, chest: null };
-let basePose = {}; // local rest rotations for animated bones
-let armCalib = { r: null, l: null }; // calibrated upper-arm offsets
 let yawOffset = 0; // auto-calibrated so the avatar doesn't "walk backwards"
 
 function toStandardMaterials(obj){
@@ -614,8 +511,23 @@ async function loadAvatar(){
       avatarRoot.position.set(0.2, 0, -0.25);
       avatarRoot.rotation.y = Math.PI * 0.15;
       scene.add(avatarRoot);
-      // Calibrate yaw offset so the avatar faces the camera and doesn't "walk backwards".
-      yawOffset = 0; // will be auto-calibrated after matrices are ready
+
+      // Calibrate model forward direction.
+      // Some VRM models face -Z in their local space, which makes movement look like walking backwards.
+      // We compare +Z vs -Z against the camera direction and pick the one that best faces the camera.
+      try{
+        const q = new THREE.Quaternion();
+        avatarRoot.getWorldQuaternion(q);
+        const fwd = new THREE.Vector3(0,0,1).applyQuaternion(q);
+        const toCam = new THREE.Vector3().subVectors(camera.position, avatarRoot.position);
+        toCam.y = 0;
+        if (toCam.lengthSq() > 1e-6) toCam.normalize();
+        const dotPlus = fwd.dot(toCam);
+        const dotMinus = fwd.clone().multiplyScalar(-1).dot(toCam);
+        yawOffset = (dotMinus > dotPlus) ? Math.PI : 0;
+      }catch{
+        yawOffset = 0;
+      }
 
       // If we were using a lightweight fallback on mobile, swap to the real avatar now
       if (fallback){
@@ -647,29 +559,21 @@ async function loadAvatar(){
         rUpperLeg: getBone(VRMHumanBoneName.RightUpperLeg),
         rLowerLeg: getBone(VRMHumanBoneName.RightLowerLeg),
         rFoot: getBone(VRMHumanBoneName.RightFoot),
+        rToes: getBone(VRMHumanBoneName.RightToes),
         lUpperLeg: getBone(VRMHumanBoneName.LeftUpperLeg),
         lLowerLeg: getBone(VRMHumanBoneName.LeftLowerLeg),
-        lFoot: getBone(VRMHumanBoneName.LeftFoot)
+        lFoot: getBone(VRMHumanBoneName.LeftFoot),
+        lToes: getBone(VRMHumanBoneName.LeftToes)
       };
 
       detectExpressions();
 
-      // Cache base local rotations (rest pose). We'll apply all animation as offsets from these.
-      basePose = {};
-      for (const [k,b] of Object.entries(bones)){
-        if (b?.quaternion) basePose[k] = b.quaternion.clone();
-      }
-
-      // Look-at uses these bases too
+      // Cache base local rotations for look-at offsets
       baseLook = {
-        head: basePose.head || bones.head?.quaternion?.clone?.() || null,
-        neck: basePose.neck || bones.neck?.quaternion?.clone?.() || null,
-        chest: basePose.chest || bones.chest?.quaternion?.clone?.() || null
+        head: bones.head?.quaternion?.clone?.() || null,
+        neck: bones.neck?.quaternion?.clone?.() || null,
+        chest: bones.chest?.quaternion?.clone?.() || null
       };
-
-      // Calibrate facing + safe arms-down offsets once per model
-      calibrateYawOffset();
-      calibrateArmsDown();
 
       // Calm base pose
       applyUpperBodyPose(0, { kind:'idle', wave:0, happy:0, sad:0, angry:0, talk:0 }, 1);
@@ -680,6 +584,96 @@ async function loadAvatar(){
       resolve(false);
     });
   });
+}
+
+async function loadVRMAMotionPack(){
+  if (!vrm || vrmaLoaded) return;
+
+  // Prepare mixer on the avatar root
+  vrmaMixer = new THREE.AnimationMixer(vrm.scene);
+  vrmaActions = {};
+  vrmaCurrentKey = null;
+  vrmaLoaded = false;
+
+  // When a VRMA (gesture) ends, fall back to procedural idle
+  vrmaMixer.addEventListener('finished', () => {
+    vrmaCurrentKey = null;
+  });
+
+  const animLoader = new GLTFLoader();
+  animLoader.register((parser) => new VRMAnimationLoaderPlugin(parser));
+
+  const files = [
+    ['show',     'assets/motions/VRMA_01.vrma'],
+    ['greeting', 'assets/motions/VRMA_02.vrma'],
+    ['peace',    'assets/motions/VRMA_03.vrma'],
+    ['shoot',    'assets/motions/VRMA_04.vrma'],
+    ['spin',     'assets/motions/VRMA_05.vrma'],
+    ['pose',     'assets/motions/VRMA_06.vrma'],
+    ['squat',    'assets/motions/VRMA_07.vrma'],
+  ];
+
+  const loadOne = (url) => new Promise((resolve) => {
+    animLoader.load(
+      url,
+      (gltf) => {
+        const list = gltf?.userData?.vrmAnimations;
+        resolve(Array.isArray(list) && list.length ? list[0] : null);
+      },
+      undefined,
+      () => resolve(null),
+    );
+  });
+
+  // Load sequentially to reduce memory spikes on mobile.
+  for (const [key, url] of files){
+    const vrmAnim = await loadOne(url);
+    if (!vrmAnim) continue;
+    const clip = createVRMAnimationClip(vrmAnim, vrm);
+    const action = vrmaMixer.clipAction(clip);
+    action.enabled = true;
+    action.clampWhenFinished = true;
+    vrmaActions[key] = action;
+  }
+
+  vrmaLoaded = Object.keys(vrmaActions).length > 0;
+}
+
+function playVRMA(key){
+  if (!vrmaLoaded || !vrmaMixer) return false;
+  const action = vrmaActions[key];
+  if (!action) return false;
+
+  // Stop current VRMA action (if any)
+  if (vrmaCurrentKey && vrmaActions[vrmaCurrentKey]){
+    vrmaActions[vrmaCurrentKey].fadeOut(0.15);
+  }
+
+  vrmaCurrentKey = key;
+  action.reset();
+
+  // Most of the pack motions are gestures; play once.
+  // (You can loop by changing setLoop below.)
+  action.setLoop(THREE.LoopOnce, 1);
+  action.fadeIn(0.12);
+  action.play();
+
+  // Keep attention / stop wandering during the gesture
+  try{
+    const d = Math.max(0.8, action.getClip().duration || 2.0);
+    requestAttention(d + 1.0);
+    if (interaction){
+      interaction.mode = 'respond';
+      interaction.respondUntil = Math.max(interaction.respondUntil || 0, clock.elapsedTime + d + 0.35);
+    }
+  }catch{}
+  return true;
+}
+
+function isVRMAActive(){
+  if (!vrmaLoaded || !vrmaCurrentKey) return false;
+  const a = vrmaActions[vrmaCurrentKey];
+  return !!(a && a.isRunning());
 }
 
 // ---------- Mobile fallback avatar (very light) ----------
@@ -741,7 +735,7 @@ let moveAmount = 0; // 0..1
 
 // Wandering around the diorama
 const wander = {
-  active: true,
+  active: false,
   pointIndex: 0,
   nextSwitchAt: 0,
   points: [
@@ -820,7 +814,7 @@ function updateApproach(dt){
   pos.x = THREE.MathUtils.clamp(pos.x, -2.05, 2.05);
   pos.z = THREE.MathUtils.clamp(pos.z, -2.05, 2.05);
 
-  const yaw = yawFromDirXZ(dir);
+  const yaw = Math.atan2(dir.x, dir.z) + yawOffset;
   root.rotation.y = lerpAngle(root.rotation.y, yaw, 1 - Math.exp(-dt * 7));
 
   // subtle bob
@@ -852,7 +846,8 @@ function updateInteraction(dt){
   // wander only when not paying attention
   const attentive = speaking || gesture.type !== 'none' || clock.elapsedTime < interaction.attentionUntil;
   if (!attentive){
-    updateWander(dt);
+    // walking disabled: no wandering movement
+    moveAmount = THREE.MathUtils.lerp(moveAmount, 0, 1 - Math.exp(-dt * 8));
   } else {
     moveAmount = THREE.MathUtils.lerp(moveAmount, 0, 1 - Math.exp(-dt * 6));
   }
@@ -881,7 +876,7 @@ function faceCameraYaw(dt, strength=10){
   // Blend: makes "look at the camera" feel stronger when camera is orbiting
   const dir = dirPos.clone().lerp(dirView, 0.35).normalize();
 
-  const targetYaw = yawFromDirXZ(dir);
+  const targetYaw = Math.atan2(dir.x, dir.z) + yawOffset;
   root.rotation.y = lerpAngle(root.rotation.y, targetYaw, 1 - Math.exp(-dt * strength));
 }
 
@@ -946,17 +941,16 @@ const BASE = {
   // Calm idle: hands gently together in front (no T-pose, no arm flapping)
   // NOTE: values are tuned for the bundled base_female VRM (many exports start in a T-pose).
   // These are *stronger* than before to ensure arms come down instead of staying horizontal.
-  rUpperArm: new THREE.Euler(0.15, -0.20, 1.10),
-  rLowerArm: new THREE.Euler(-1.05, 0.10, 0.18),
-  rHand: new THREE.Euler(0.05, -0.10, 0.10),
-  lUpperArm: new THREE.Euler(0.15, 0.20, -1.10),
-  lLowerArm: new THREE.Euler(-1.05, -0.10, -0.18),
-  lHand: new THREE.Euler(0.05, 0.10, -0.10),
+  rUpperArm: new THREE.Euler(0.10, -0.10, 0.35),
+  rLowerArm: new THREE.Euler(-0.70, 0.05, 0.10),
+  rHand: new THREE.Euler(0.02, -0.06, 0.06),
+  lUpperArm: new THREE.Euler(0.10, 0.10, -0.35),
+  lLowerArm: new THREE.Euler(-0.70, -0.05, -0.10),
+  lHand: new THREE.Euler(0.02, 0.06, -0.06),
   chest: new THREE.Euler(0.00, 0.00, 0.00)
 };
 
 function slerpToEuler(bone, euler, alpha){
-  // Absolute pose helper (kept for legacy). Prefer slerpToEulerRel() with basePose.
   if (!bone) return;
   const q = new THREE.Quaternion().setFromEuler(euler);
   bone.quaternion.slerp(q, alpha);
@@ -988,17 +982,33 @@ function applyUpperBodyPose(dt, state, alpha){
     0,
     0
   );
-  slerpToEulerRel(bones.chest, basePose.chest, chestEuler, a);
+  slerpToEuler(bones.chest, chestEuler, a);
 
   const sWalk = Math.sin(walkPhase);
   const swing = 0.0; // keep hands together even while walking
+  // Dynamic arm-down bias: if the model's rest pose has arms raised (T/A pose), gently bring them down.
+  const armDownBias = (upper, lower, sign) => {
+    if (!upper || !lower) return 0;
+    const p0 = new THREE.Vector3();
+    const p1 = new THREE.Vector3();
+    upper.getWorldPosition(p0);
+    lower.getWorldPosition(p1);
+    const v = p1.sub(p0);
+    if (v.lengthSq() < 1e-6) return 0;
+    v.normalize();
+    // World-space y: -1 is down, 0 is horizontal, +1 is up
+    const y = v.y;
+    if (y < -0.25) return 0; // already pointing down enough
+    const amt = THREE.MathUtils.clamp((y + 0.25) * 1.4, 0, 1.2);
+    return sign * amt;
+  };
+
 
   // Arms: calm by default, small swing when walking, gestures override
-  const baseR = armCalib.r || BASE.rUpperArm;
   const rUA = new THREE.Euler(
-    baseR.x - 0.08*happy + 0.05*sad + swing*sWalk,
-    baseR.y,
-    baseR.z + swing*0.6
+    BASE.rUpperArm.x - 0.08*happy + 0.05*sad + swing*sWalk,
+    BASE.rUpperArm.y,
+    BASE.rUpperArm.z + swing*0.6 + armDownBias(bones.rUpperArm, bones.rLowerArm, +1)
   );
   const rLA = new THREE.Euler(
     BASE.rLowerArm.x,
@@ -1030,19 +1040,18 @@ function applyUpperBodyPose(dt, state, alpha){
     rLA.set(-0.95, 0.18, 0.10);
   }
 
-  slerpToEulerRel(bones.rUpperArm, basePose.rUpperArm, rUA, a);
-  slerpToEulerRel(bones.rLowerArm, basePose.rLowerArm, rLA, a);
+  slerpToEuler(bones.rUpperArm, rUA, a);
+  slerpToEuler(bones.rLowerArm, rLA, a);
 
   if (bones.rHand){
     const wig = wave > 0 ? Math.sin(clock.elapsedTime * 10) * 0.35 * wave : 0;
-    slerpToEulerRel(bones.rHand, basePose.rHand, new THREE.Euler(0,0,wig), a * 0.7);
+    slerpToEuler(bones.rHand, new THREE.Euler(0,0,wig), a * 0.7);
   }
 
-  const baseL = armCalib.l || BASE.lUpperArm;
   const lUA = new THREE.Euler(
-    baseL.x - 0.08*happy + 0.05*sad - swing*sWalk,
-    baseL.y,
-    baseL.z - swing*0.6
+    BASE.lUpperArm.x - 0.08*happy + 0.05*sad - swing*sWalk,
+    BASE.lUpperArm.y,
+    BASE.lUpperArm.z - swing*0.6 + armDownBias(bones.lUpperArm, bones.lLowerArm, -1)
   );
   const lLA = new THREE.Euler(BASE.lLowerArm.x, BASE.lLowerArm.y, BASE.lLowerArm.z);
 
@@ -1059,9 +1068,9 @@ function applyUpperBodyPose(dt, state, alpha){
     lUA.set(0.30, 0.15, -0.65);
     lLA.set(-0.85, -0.18, -0.10);
   }
-  slerpToEulerRel(bones.lUpperArm, basePose.lUpperArm, lUA, a);
-  slerpToEulerRel(bones.lLowerArm, basePose.lLowerArm, lLA, a);
-  slerpToEulerRel(bones.lHand, basePose.lHand, BASE.lHand, a);
+  slerpToEuler(bones.lUpperArm, lUA, a);
+  slerpToEuler(bones.lLowerArm, lLA, a);
+  slerpToEuler(bones.lHand, BASE.lHand, a);
 
   // Head nod add (keep small, head lookAt handles most)
   if (bones.neck && nod){
@@ -1253,7 +1262,7 @@ function updateWander(dt){
     pos.x = THREE.MathUtils.clamp(pos.x, -2.05, 2.05);
     pos.z = THREE.MathUtils.clamp(pos.z, -2.05, 2.05);
 
-    const yaw = yawFromDirXZ(dir);
+    const yaw = Math.atan2(dir.x, dir.z) + yawOffset;
     root.rotation.y = lerpAngle(root.rotation.y, yaw, 1 - Math.exp(-dt * 4));
 
     // tiny step bob (subtle)
@@ -1267,45 +1276,44 @@ function updateWander(dt){
 }
 
 function applyWalkCycle(dt){
+  // Repurposed: walking/locomotion is disabled.
+  // Keep the avatar idle, but add a subtle "foot-only" idle motion (tap / weight shift).
   if (!vrm) return;
-  const moving = moveAmount > 0.15 && wander.active && !speaking && gesture.type === 'none';
+
   const a = 1 - Math.exp(-dt * 10);
+  const t = clock.elapsedTime;
 
-  // legs swing in opposite phase
-  const s = Math.sin(walkPhase);
-  const c = Math.cos(walkPhase);
-  const stride = moving ? 0.35 * moveAmount : 0;
-  const knee = moving ? 0.55 * moveAmount : 0;
+  // Subtle alternating phase
+  const phase = t * 2.2;
+  const l = 0.5 + 0.5 * Math.sin(phase);
+  const r = 0.5 + 0.5 * Math.sin(phase + Math.PI);
 
-  // hips gentle sway
-  // feminine sway: subtle chest counter-roll + tiny bounce
-  if (bones.chest){
-    const sway = moving ? (-s * 0.040 * moveAmount) : 0;
-    const bounce = moving ? (Math.abs(c) * 0.010 * moveAmount) : 0;
-    slerpToEulerRel(bones.chest, basePose.chest, new THREE.Euler(bounce, 0, sway), a * 0.55);
-  }
-
+  // Keep hips stable (no walking bob)
   if (bones.hips){
-    const hipsOff = new THREE.Euler(0, 0, moving ? s * 0.10 * moveAmount : 0);
-    slerpToEulerRel(bones.hips, basePose.hips, hipsOff, a * 0.70);
+    // tiny sway only (almost imperceptible)
+    const sway = Math.sin(phase) * 0.01;
+    slerpToEuler(bones.hips, new THREE.Euler(0, 0, sway), a * 0.35);
   }
 
-  // Right leg forward when sin positive
-  slerpToEulerRel(bones.rUpperLeg, basePose.rUpperLeg, new THREE.Euler( stride * s, 0, 0), a);
-  slerpToEulerRel(bones.lUpperLeg, basePose.lUpperLeg, new THREE.Euler(-stride * s, 0, 0), a);
+  // Feet / knees only (small ranges so it won't look like dancing)
+  const knee = 0.16;
+  const foot = 0.22;
+  const toe  = 0.12;
 
-  // knees bend more when leg goes back (cos phase)
-  slerpToEulerRel(bones.rLowerLeg, basePose.rLowerLeg, new THREE.Euler( knee * Math.max(0, -c), 0, 0), a);
-  slerpToEulerRel(bones.lLowerLeg, basePose.lLowerLeg, new THREE.Euler( knee * Math.max(0, c), 0, 0), a);
+  // Knee flex when that side "lifts"
+  slerpToEuler(bones.lLowerLeg, new THREE.Euler(knee * l, 0, 0), a * 0.85);
+  slerpToEuler(bones.rLowerLeg, new THREE.Euler(knee * r, 0, 0), a * 0.85);
 
-  // feet keep mostly flat
-  slerpToEulerRel(bones.rFoot, basePose.rFoot, new THREE.Euler(-0.08 * stride * s, 0, 0), a);
-  slerpToEulerRel(bones.lFoot, basePose.lFoot, new THREE.Euler( 0.08 * stride * s, 0, 0), a);
+  // Foot: heel/toe rock. Sign can vary per export; keep it symmetric and small.
+  slerpToEuler(bones.lFoot, new THREE.Euler(-foot * l, 0, 0), a * 0.85);
+  slerpToEuler(bones.rFoot, new THREE.Euler(-foot * r, 0, 0), a * 0.85);
 
-  // decay to idle when not moving
-  if (!moving){
-    moveAmount = THREE.MathUtils.lerp(moveAmount, 0, 1 - Math.exp(-dt * 6));
-  }
+  // Toes if available
+  slerpToEuler(bones.lToes, new THREE.Euler(toe * l, 0, 0), a * 0.85);
+  slerpToEuler(bones.rToes, new THREE.Euler(toe * r, 0, 0), a * 0.85);
+
+  // No locomotion
+  moveAmount = THREE.MathUtils.lerp(moveAmount, 0, 1 - Math.exp(-dt * 10));
 }
 
 // ---------------- Chat logic ----------------
@@ -1373,6 +1381,18 @@ function classify(text){
   const t = text.trim().toLowerCase();
   const has = (...keys) => keys.some(k => t.includes(k));
 
+  // VRMA motion pack shortcuts
+  // Example: "모션3", "vrma 5", "motion_2"
+  const m = t.match(/(?:모션|motion|vrma)\s*[_-]?(\d)/);
+  if (m){
+    const n = Math.max(1, Math.min(7, parseInt(m[1], 10)));
+    return `vrma_${n}`;
+  }
+  if (has('피스','브이','peace')) return 'vrma_3';
+  if (has('총','쏴','shoot')) return 'vrma_4';
+  if (has('스핀','돌아','spin')) return 'vrma_5';
+  if (has('스쿼트','스쿼시','squat')) return 'vrma_7';
+
   if (has('인사','안녕','하이','hello','hi')) return 'greet';
   if (has('기쁨','행복','좋아','신나','축하','최고')) return 'happy';
   if (has('슬픔','우울','눈물','힘들','속상')) return 'sad';
@@ -1391,16 +1411,46 @@ function reactTo(kind){
   requestAttention(7);
   startApproachToUser(7);
 
+  // Direct VRMA triggers (no need for emotion classification)
+  if (kind.startsWith('vrma_')){
+    const n = parseInt(kind.split('_')[1] || '0', 10);
+    const map = {
+      1: 'show',
+      2: 'greeting',
+      3: 'peace',
+      4: 'shoot',
+      5: 'spin',
+      6: 'pose',
+      7: 'squat',
+    };
+    const key = map[n];
+    const ok = key ? playVRMA(key) : false;
+    if (!ok){
+      addBubble('시스템', '모션팩이 아직 로딩 중이거나, 해당 모션을 못 찾았어요. 잠깐만 기다렸다가 다시...');
+    } else {
+      addBubble('VTuber', `모션${n} 실행!`);
+    }
+    return;
+  }
+
   const reply = pick(RESPONSES[kind] || RESPONSES.normal);
   addBubble('VTuber', reply);
   speak(reply);
 
   // Motion tuning (length + intensity per emotion)
-  if (kind === 'greet') startGesture('wave', 1.55, 1.0);
+  // Prefer VRMA gestures when available, otherwise use procedural pose.
+  if (kind === 'greet'){
+    if (!playVRMA('greeting')) startGesture('wave', 1.55, 1.0);
+  }
+  else if (kind === 'thanks'){
+    if (!playVRMA('peace')) startGesture('happy', 1.6, 0.9);
+  }
   else if (kind === 'happy') startGesture('happy', 2.10, 1.05);
   else if (kind === 'sad') startGesture('sad', 2.60, 0.95);
   else if (kind === 'angry') startGesture('angry', 1.85, 1.0);
-  else if (kind === 'surprise') startGesture('surprise', 1.35, 1.05);
+  else if (kind === 'surprise'){
+    if (!playVRMA('show')) startGesture('surprise', 1.35, 1.05);
+  }
   else if (kind === 'shy') startGesture('shy', 2.05, 0.95);
   else if (kind === 'think') startGesture('think', 2.40, 0.95);
   else startGesture('happy', 1.25, 0.70);
@@ -1454,12 +1504,22 @@ elText.addEventListener('keydown', (e) => {
     addBubble('시스템', '그래도 안 되면 다른 브라우저(Chrome/Edge/Safari)에서 열어봐줘!');
   } else {
     addBubble('VTuber', '로딩 완료! 이제 얘기해보자~');
+
+    // Load VRMA motion pack after the avatar is visible (keeps first load snappy)
+    loadVRMAMotionPack().then(() => {
+      if (vrmaLoaded){
+        addBubble('시스템', '모션팩(VRMA) 로딩 완료! “모션1~7” 또는 “피스/총/스핀/스쿼트” 같은 말로 실행해볼 수 있어요.');
+      }
+    });
   }
 
   function tick(){
     const dt = Math.min(0.033, clock.getDelta());
 
     controls.update();
+
+    if (vrm) vrm.update(dt);
+    if (vrmaMixer) vrmaMixer.update(dt);
 
     // Interaction & gaze
     updateInteraction(dt);
@@ -1472,18 +1532,22 @@ elText.addEventListener('keydown', (e) => {
       lookAtCameraUpperBody(dt, 0.25);
     }
 
+    const vrmaActive = isVRMAActive();
+
     // Gestures / pose
-    updateGesture(dt);
-    const w = gestureWeights();
-    const talk = speaking ? 1 : 0;
-    const walk = (wander.active && gesture.type === 'none' && !speaking) ? moveAmount : 0;
-    applyUpperBodyPose(dt, { kind:'idle', talk, walk, ...w }, 1 - Math.exp(-dt * 9));
-    applyWalkCycle(dt);
+    if (!vrmaActive){
+      updateGesture(dt);
+      const w = gestureWeights();
+      const talk = speaking ? 1 : 0;
+      const walk = 0; // walking disabled
+      applyUpperBodyPose(dt, { kind:'idle', talk, walk, ...w }, 1 - Math.exp(-dt * 9));
+      applyWalkCycle(dt);
+    }
 
     // Happy bounce (subtle)
     const root = actor();
     if (root){
-      if (gesture.type === 'happy'){
+      if (!vrmaActive && gesture.type === 'happy'){
         root.position.y = 0.01 + Math.sin(clock.elapsedTime * 9.0) * 0.012;
       } else if (interaction.mode !== 'wander'){
         root.position.y = 0;
@@ -1492,9 +1556,6 @@ elText.addEventListener('keydown', (e) => {
 
     updateBlink(dt);
     updateMouth(dt);
-
-    // Update VRM constraints/spring bones AFTER posing
-    if (vrm) vrm.update(dt);
 
     renderer.render(scene, camera);
     requestAnimationFrame(tick);
