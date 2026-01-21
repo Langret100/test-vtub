@@ -3,10 +3,10 @@ import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
-import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
 import { ShaderPass } from 'three/examples/jsm/postprocessing/ShaderPass.js';
 import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
 import { FXAAShader } from 'three/examples/jsm/shaders/FXAAShader.js';
+import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import { VignetteShader } from 'three/examples/jsm/shaders/VignetteShader.js';
 import { ColorCorrectionShader } from 'three/examples/jsm/shaders/ColorCorrectionShader.js';
 
@@ -193,6 +193,13 @@ renderer.toneMappingExposure = isMobile() ? 1.02 : 1.08; // tuned to match VRoid
 
 const scene = new THREE.Scene();
 scene.fog = new THREE.Fog(0xf6d9ff, 6, 22);
+// Subtle studio-like environment reflections (helps skin highlights without bloom)
+try{
+  const pmrem = new THREE.PMREMGenerator(renderer);
+  const envTex = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+  pmrem.dispose();
+  scene.environment = envTex;
+}catch{ /* ignore */ }
 
 // Eye gaze target (drives VRM lookAt)
 const gazeTarget = new THREE.Object3D();
@@ -215,16 +222,11 @@ if (isMobile()){
   controls.enableZoom = true;
 }
 
-// --- Postprocessing (ENB-ish: bloom + color grading + vignette + FXAA) ---
+// --- Postprocessing (bright: color grading + vignette + FXAA; no bloom) ---
 const composer = new EffectComposer(renderer);
 const renderPass = new RenderPass(scene, camera);
 composer.addPass(renderPass);
 
-const bloomStrength = isMobile() ? 0.30 : 0.48; // softer bloom (avoid glare)
-const bloomRadius   = isMobile() ? 0.22 : 0.30;
-const bloomThreshold = 0.35; // higher threshold => fewer pixels bloom
-const bloomPass = new UnrealBloomPass(new THREE.Vector2(1, 1), bloomStrength, bloomRadius, bloomThreshold);
-composer.addPass(bloomPass);
 
 const colorPass = new ShaderPass(ColorCorrectionShader);
 colorPass.uniforms.powRGB.value.set(1.0, 1.0, 1.0);
@@ -545,6 +547,70 @@ function toStandardMaterials(obj){
   });
 }
 
+function tuneSkinHighlights(obj){
+  // Goal: no bloom, but keep skin looking lively with gentle specular highlights.
+  // Heuristic: match face/body/skin materials; exclude eyes/hair/clothes.
+  const isSkinLike = (meshName, mat, mapSrc) => {
+    const s = `${meshName||''} ${mat?.name||''} ${mapSrc||''}`.toLowerCase();
+    const has = (...keys) => keys.some(k => s.includes(k));
+    const not = (...keys) => keys.some(k => s.includes(k));
+    if (not('eye','iris','pupil','sclera','lash','brow','teeth','tongue','mouth','hair','cloth','skirt','shoe','sock','uniform','button','tie')) return false;
+    return has('skin','face','body','head','hada','flesh','arm','leg','neck');
+  };
+
+  obj.traverse((n) => {
+    if (!n.isMesh) return;
+    const mats = Array.isArray(n.material) ? n.material : [n.material];
+    let changed = false;
+
+    const tuned = mats.map((m) => {
+      if (!m) return m;
+      const mapSrc = m.map?.image?.src || m.map?.source?.data?.src || '';
+      if (!isSkinLike(n.name, m, mapSrc)) return m;
+
+      // Upgrade to physical material for nicer highlights, preserving textures.
+      const phys = new THREE.MeshPhysicalMaterial();
+      // Basic copies
+      if (m.color) phys.color = m.color.clone();
+      phys.map = m.map || null;
+      phys.emissive = (m.emissive ? m.emissive.clone() : new THREE.Color(0x000000));
+      phys.emissiveMap = m.emissiveMap || null;
+      phys.normalMap = m.normalMap || null;
+      phys.roughnessMap = m.roughnessMap || null;
+      phys.metalnessMap = m.metalnessMap || null;
+      phys.alphaMap = m.alphaMap || null;
+      phys.transparent = !!m.transparent;
+      phys.opacity = (typeof m.opacity === 'number') ? m.opacity : 1;
+      phys.side = m.side;
+      phys.alphaTest = m.alphaTest || 0;
+      phys.depthWrite = m.depthWrite;
+
+      // Tuning: gentle, not oily
+      phys.metalness = 0.0;
+      phys.roughness = 0.55;
+      phys.clearcoat = 0.10;
+      phys.clearcoatRoughness = 0.65;
+      phys.reflectivity = 0.20;
+      phys.envMapIntensity = 0.35;
+
+      // Optional newer props (safe even if ignored)
+      try{
+        if ('ior' in phys) phys.ior = 1.4;
+        if ('specularIntensity' in phys) phys.specularIntensity = 0.25;
+        if ('specularColor' in phys) phys.specularColor.set(0xffffff);
+      }catch{}
+
+      phys.needsUpdate = true;
+      changed = true;
+      try{ m.dispose?.(); }catch{}
+      return phys;
+    });
+
+    if (changed){
+      n.material = Array.isArray(n.material) ? tuned : tuned[0];
+    }
+  });
+}
 function setExpression(name, v){
   if (!vrm?.expressionManager) return;
   try{ vrm.expressionManager.setValue(name, v); }catch{ /* ignore */ }
@@ -654,6 +720,7 @@ async function loadAvatar(){
 
       // 모바일 안정성: MToon 셰이더 대신 표준 머티리얼로 변환
       toStandardMaterials(avatarRoot);
+      tuneSkinHighlights(avatarRoot);
 
       // Remove unnecessary stuff to speed up
       try{ VRMUtils.removeUnnecessaryJoints(avatarRoot); }catch{}
