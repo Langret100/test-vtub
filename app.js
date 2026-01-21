@@ -509,7 +509,7 @@ async function loadAvatar(){
 
       avatarRoot = vrm.scene;
       avatarRoot.position.set(0.2, 0, -0.25);
-      avatarRoot.rotation.y = Math.PI * 0.15;
+      avatarRoot.rotation.y = 0;
       scene.add(avatarRoot);
 
       // Calibrate model forward direction.
@@ -518,13 +518,14 @@ async function loadAvatar(){
       try{
         const q = new THREE.Quaternion();
         avatarRoot.getWorldQuaternion(q);
-        const fwd = new THREE.Vector3(0,0,1).applyQuaternion(q);
+        const fwd = new THREE.Vector3(0,0,-1).applyQuaternion(q);
         const toCam = new THREE.Vector3().subVectors(camera.position, avatarRoot.position);
         toCam.y = 0;
         if (toCam.lengthSq() > 1e-6) toCam.normalize();
         const dotPlus = fwd.dot(toCam);
         const dotMinus = fwd.clone().multiplyScalar(-1).dot(toCam);
-        yawOffset = (dotMinus > dotPlus) ? Math.PI : 0;
+        if (dotMinus > dotPlus){ avatarRoot.rotation.y += Math.PI; }
+        yawOffset = 0;
       }catch{
         yawOffset = 0;
       }
@@ -611,6 +612,7 @@ async function loadVRMAMotionPack(){
     ['spin',     'assets/motions/VRMA_05.vrma'],
     ['pose',     'assets/motions/VRMA_06.vrma'],
     ['squat',    'assets/motions/VRMA_07.vrma'],
+    ['motion7',  'assets/motions/VRMA_07.vrma'],
   ];
 
   const loadOne = (url) => new Promise((resolve) => {
@@ -639,34 +641,44 @@ async function loadVRMAMotionPack(){
   vrmaLoaded = Object.keys(vrmaActions).length > 0;
 }
 
-function playVRMA(key){
+function playVRMA(key, opts = {}){
   if (!vrmaLoaded || !vrmaMixer) return false;
   const action = vrmaActions[key];
   if (!action) return false;
 
+  const loop = opts.loop ?? 'once'; // 'once' | 'repeat'
+  const fadeIn = opts.fadeIn ?? 0.12;
+  const fadeOut = opts.fadeOut ?? 0.15;
+
   // Stop current VRMA action (if any)
   if (vrmaCurrentKey && vrmaActions[vrmaCurrentKey]){
-    vrmaActions[vrmaCurrentKey].fadeOut(0.15);
+    vrmaActions[vrmaCurrentKey].fadeOut(fadeOut);
   }
 
   vrmaCurrentKey = key;
   action.reset();
 
-  // Most of the pack motions are gestures; play once.
-  // (You can loop by changing setLoop below.)
-  action.setLoop(THREE.LoopOnce, 1);
-  action.fadeIn(0.12);
+  if (loop === 'repeat'){
+    action.setLoop(THREE.LoopRepeat, Infinity);
+  } else {
+    action.setLoop(THREE.LoopOnce, 1);
+    action.clampWhenFinished = true;
+  }
+
+  action.fadeIn(fadeIn);
   action.play();
 
-  // Keep attention / stop wandering during the gesture
-  try{
-    const d = Math.max(0.8, action.getClip().duration || 2.0);
-    requestAttention(d + 1.0);
-    if (interaction){
-      interaction.mode = 'respond';
-      interaction.respondUntil = Math.max(interaction.respondUntil || 0, clock.elapsedTime + d + 0.35);
-    }
-  }catch{}
+  // Keep attention / stop wandering during one-shot gestures
+  if (loop !== 'repeat'){
+    try{
+      const d = Math.max(0.8, action.getClip().duration || 2.0);
+      requestAttention(d + 1.0);
+      if (interaction){
+        interaction.mode = 'respond';
+        interaction.respondUntil = clock.elapsedTime + d + 0.2;
+      }
+    }catch{}
+  }
   return true;
 }
 
@@ -814,7 +826,7 @@ function updateApproach(dt){
   pos.x = THREE.MathUtils.clamp(pos.x, -2.05, 2.05);
   pos.z = THREE.MathUtils.clamp(pos.z, -2.05, 2.05);
 
-  const yaw = Math.atan2(dir.x, dir.z) + yawOffset;
+  const yaw = Math.atan2(dir.x, -dir.z);
   root.rotation.y = lerpAngle(root.rotation.y, yaw, 1 - Math.exp(-dt * 7));
 
   // subtle bob
@@ -876,7 +888,7 @@ function faceCameraYaw(dt, strength=10){
   // Blend: makes "look at the camera" feel stronger when camera is orbiting
   const dir = dirPos.clone().lerp(dirView, 0.35).normalize();
 
-  const targetYaw = Math.atan2(dir.x, dir.z) + yawOffset;
+  const targetYaw = Math.atan2(dir.x, -dir.z);
   root.rotation.y = lerpAngle(root.rotation.y, targetYaw, 1 - Math.exp(-dt * strength));
 }
 
@@ -1262,7 +1274,7 @@ function updateWander(dt){
     pos.x = THREE.MathUtils.clamp(pos.x, -2.05, 2.05);
     pos.z = THREE.MathUtils.clamp(pos.z, -2.05, 2.05);
 
-    const yaw = Math.atan2(dir.x, dir.z) + yawOffset;
+    const yaw = Math.atan2(dir.x, -dir.z);
     root.rotation.y = lerpAngle(root.rotation.y, yaw, 1 - Math.exp(-dt * 4));
 
     // tiny step bob (subtle)
@@ -1509,6 +1521,10 @@ elText.addEventListener('keydown', (e) => {
     loadVRMAMotionPack().then(() => {
       if (vrmaLoaded){
         addBubble('시스템', '모션팩(VRMA) 로딩 완료! “모션1~7” 또는 “피스/총/스핀/스쿼트” 같은 말로 실행해볼 수 있어요.');
+
+        // Default: always play Motion 7 as the idle loop (no walking).
+        playVRMA('motion7', { loop: 'repeat', fadeIn: 0.25 });
+        requestAttention(9999);
       }
     });
   }
@@ -1535,13 +1551,11 @@ elText.addEventListener('keydown', (e) => {
     const vrmaActive = isVRMAActive();
 
     // Gestures / pose
+    // When no VRMA is playing, we do NOT force any arm/hand pose.
+    // (Forcing absolute arm rotations caused raised-arm / T-pose issues on different avatars.)
     if (!vrmaActive){
       updateGesture(dt);
-      const w = gestureWeights();
-      const talk = speaking ? 1 : 0;
-      const walk = 0; // walking disabled
-      applyUpperBodyPose(dt, { kind:'idle', talk, walk, ...w }, 1 - Math.exp(-dt * 9));
-      applyWalkCycle(dt);
+      // No procedural walk / no procedural upper-body pose.
     }
 
     // Happy bounce (subtle)
