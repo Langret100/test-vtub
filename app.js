@@ -1,7 +1,7 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
-import { SkeletonUtils } from 'three/examples/jsm/utils/SkeletonUtils.js';
+import * as SkeletonUtils from 'three/examples/jsm/utils/SkeletonUtils.js';
 import { VRMLoaderPlugin, VRMUtils, VRMHumanBoneName } from '@pixiv/three-vrm';
 
 // perf: enable three.js internal request cache for repeated loads
@@ -52,6 +52,62 @@ function lerpAngle(a, b, t){
 function isMobile(){
   return matchMedia('(max-width: 879px)').matches || /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
 }
+
+// ---------------- Motion styling (female overlay) ----------------
+// The user told us this avatar is female. We keep the base motion CC0,
+// but add a subtle overlay (hip sway / softer shoulders) so it reads more feminine.
+const MOTION_STYLE = {
+  gender: 'female',
+  enableFeminineOverlay: true,
+};
+
+const _femPrev = {};
+function _applyEulerOffset(bone, key, x=0, y=0, z=0){
+  if (!bone) return;
+  const prev = _femPrev[key] || (_femPrev[key] = { x:0, y:0, z:0 });
+  // Remove previous frame's offset so we don't accumulate drift.
+  bone.rotation.x -= prev.x;
+  bone.rotation.y -= prev.y;
+  bone.rotation.z -= prev.z;
+
+  bone.rotation.x += x;
+  bone.rotation.y += y;
+  bone.rotation.z += z;
+  prev.x = x; prev.y = y; prev.z = z;
+}
+
+function applyFeminineMotionStyle(walkAmount=0){
+  if (!MOTION_STYLE.enableFeminineOverlay) return;
+  if (!bones?.hips) return;
+
+  const t = clock.elapsedTime;
+  const walk = Math.max(0, Math.min(1, walkAmount));
+  const idle = 1 - walk;
+
+  // Faster sway while walking; very subtle while idle
+  const swayFreq = idle * 1.8 + walk * 6.2;
+  const bobFreq  = idle * 3.0 + walk * 12.0;
+  const sway = Math.sin(t * swayFreq);
+
+  // Intensities (radians). Tuned to stay subtle and avoid breaking VRM constraints.
+  const hipRoll   = sway * (0.05 + 0.06 * walk);
+  const hipYaw    = sway * (0.02 + 0.05 * walk);
+  const spineRoll = -sway * (0.02 + 0.03 * walk);
+  const chestRoll = -sway * (0.02 + 0.03 * walk);
+  const headTilt  = sway * (0.01 + 0.02 * idle);
+
+  // Slight arm tuck-in (less broad swing)
+  const armSoft = (0.10 * idle + 0.18 * walk);
+
+  _applyEulerOffset(bones.hips,  'fem_hips',  0, hipYaw, hipRoll);
+  _applyEulerOffset(bones.spine, 'fem_spine', 0, 0, spineRoll);
+  _applyEulerOffset(bones.chest, 'fem_chest', 0, 0, chestRoll);
+  _applyEulerOffset(bones.head,  'fem_head',  headTilt, 0, 0);
+
+  _applyEulerOffset(bones.lUpperArm, 'fem_lua', 0, 0,  armSoft);
+  _applyEulerOffset(bones.rUpperArm, 'fem_rua', 0, 0, -armSoft);
+}
+
 
 // ---------------- TTS (Web Speech API) ----------------
 let ttsEnabled = localStorage.getItem('ttsEnabled') === '1';
@@ -586,10 +642,23 @@ async function tryInitCC0Motion(){
 
     // Normalize source bone names to VRM humanoid keys.
     renameBonesByMap(srcRoot, QUATERNUS_BONE_MAP);
+    const findExact = (needle) => anims.find(a => (a?.name || '').toLowerCase() === needle.toLowerCase()) || null;
+    const findIncl = (needle) => anims.find(a => (a?.name || '').toLowerCase().includes(needle.toLowerCase())) || null;
+    const findInclAll = (...needles) => anims.find(a => {
+      const n = (a?.name || '').toLowerCase();
+      return needles.every(x => n.includes(x.toLowerCase()));
+    }) || null;
 
-    const findClip = (needle) => anims.find(a => (a?.name || '').toLowerCase() === needle.toLowerCase()) || null;
-    const idleClip = findClip('Idle_Loop') || anims[0] || null;
-    const walkClip = findClip('Walk_Loop') || findClip('Jog_Fwd_Loop') || null;
+    // Prefer explicitly female-tagged clips if the library contains them.
+    // (Different packs use different naming conventions.)
+    const idleClip =
+      findInclAll('idle','loop','female') || findInclAll('idle','loop','woman') || findInclAll('idle','loop','girl') ||
+      findExact('Idle_Loop') || findInclAll('idle','loop') || findIncl('idle') || anims[0] || null;
+
+    const walkClip =
+      findInclAll('walk','loop','female') || findInclAll('walk','loop','woman') || findInclAll('walk','loop','girl') ||
+      findExact('Walk_Loop') || findInclAll('walk','loop') || findIncl('walk') ||
+      findExact('Jog_Fwd_Loop') || findIncl('jog') || null;
     if (!idleClip && !walkClip) return;
 
     // Retarget onto the VRM skeleton.
@@ -1603,6 +1672,9 @@ elText.addEventListener('keydown', (e) => {
       applyUpperBodyPose(dt, { kind:'idle', talk, walk, ...w }, 1 - Math.exp(-dt * 9));
       applyWalkCycle(dt);
     }
+
+    // Female motion overlay (works both with VRMA/CC0 retargeted motion and procedural pose)
+    if (MOTION_STYLE.gender === 'female') applyFeminineMotionStyle((vrma.ready ? vrma.walkWeight : walk));
 
     // Happy bounce (subtle)
     const root = actor();
