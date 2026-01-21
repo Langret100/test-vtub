@@ -545,6 +545,67 @@ let fallback = null;
 let baseLook = { head: null, neck: null, chest: null };
 let yawOffset = 0; // auto-calibrated so the avatar doesn't "walk backwards"
 
+// --- Arm safety (prevents "V arms" / raised arms from bad retargeting or mismatched rest poses) ---
+// This project mixes VRM posing + external CC0 animations. If the animation rig/rest pose doesn't match
+// the avatar (very common), arms can end up lifted in a big V shape. We enforce a safe baseline:
+// keep arms generally pointing down unless an explicit gesture is active.
+const ARM_SAFETY = {
+  enabled: true,
+  // if the upper-arm vector points above this Y threshold (world), we pull it downward
+  upYThreshold: 0.15,
+  strength: 10, // higher = faster correction
+};
+
+const _tmpV3a = new THREE.Vector3();
+const _tmpV3b = new THREE.Vector3();
+const _tmpV3c = new THREE.Vector3();
+const _tmpQ1 = new THREE.Quaternion();
+const _tmpQ2 = new THREE.Quaternion();
+const _tmpQ3 = new THREE.Quaternion();
+
+function applyBoneWorldRotation(bone, qWorldTarget, alpha){
+  if (!bone || !bone.parent) return;
+  bone.parent.getWorldQuaternion(_tmpQ1);
+  const qLocal = _tmpQ1.invert().multiply(qWorldTarget);
+  bone.quaternion.slerp(qLocal, alpha);
+}
+
+function pullArmTowardDown(dt, upperArm, lowerArm, strengthMul=1){
+  if (!upperArm || !lowerArm) return;
+
+  // Current upper-arm direction (world)
+  upperArm.getWorldPosition(_tmpV3a);
+  lowerArm.getWorldPosition(_tmpV3b);
+  const v = _tmpV3b.sub(_tmpV3a);
+  if (v.lengthSq() < 1e-8) return;
+  v.normalize();
+
+  // Only correct if it's clearly pointing upward
+  if (v.y <= ARM_SAFETY.upYThreshold) return;
+
+  const down = _tmpV3c.set(0, -1, 0);
+  const qCorr = _tmpQ2.setFromUnitVectors(v, down);
+
+  // Apply correction in world space
+  upperArm.getWorldQuaternion(_tmpQ3);
+  const qWorldTarget = qCorr.multiply(_tmpQ3);
+
+  const a = 1 - Math.exp(-dt * ARM_SAFETY.strength * strengthMul);
+  applyBoneWorldRotation(upperArm, qWorldTarget, a);
+}
+
+function applyArmSafety(dt, gesturePower=0){
+  if (!ARM_SAFETY.enabled || !vrm) return;
+
+  // If a strong gesture is active, don't fight it.
+  const g = THREE.MathUtils.clamp(gesturePower, 0, 1);
+  const allow = 1 - THREE.MathUtils.smoothstep(g, 0.15, 0.55);
+  if (allow <= 0) return;
+
+  pullArmTowardDown(dt, bones.rUpperArm, bones.rLowerArm, allow);
+  pullArmTowardDown(dt, bones.lUpperArm, bones.lLowerArm, allow);
+}
+
 function toStandardMaterials(obj){
   obj.traverse((n) => {
     if (!n.isMesh) return;
@@ -653,12 +714,12 @@ async function loadAvatar(){
       scene.add(avatarRoot);
 
       // Calibrate model forward direction.
-      // Some VRM models face -Z in their local space, which makes movement look like walking backwards.
-      // We compare +Z vs -Z against the camera direction and pick the one that best faces the camera.
+      // We assume the avatar should face -Z when rotation.y === 0 (common in VRM/Three setups).
+      // If the model is authored facing +Z, we apply a +PI yaw offset so movement doesn't look like moon-walking.
       try{
         const q = new THREE.Quaternion();
         avatarRoot.getWorldQuaternion(q);
-        const fwd = new THREE.Vector3(0,0,1).applyQuaternion(q);
+        const fwd = new THREE.Vector3(0,0,-1).applyQuaternion(q);
         const toCam = new THREE.Vector3().subVectors(camera.position, avatarRoot.position);
         toCam.y = 0;
         if (toCam.lengthSq() > 1e-6) toCam.normalize();
@@ -862,7 +923,8 @@ function updateApproach(dt){
   pos.x = THREE.MathUtils.clamp(pos.x, -2.05, 2.05);
   pos.z = THREE.MathUtils.clamp(pos.z, -2.05, 2.05);
 
-  const yaw = Math.atan2(dir.x, dir.z) + yawOffset;
+    // Face the movement direction. +PI because a Three.js Object3D faces -Z by default.
+    const yaw = Math.atan2(dir.x, dir.z) + Math.PI + yawOffset;
   root.rotation.y = lerpAngle(root.rotation.y, yaw, 1 - Math.exp(-dt * 7));
 
   // subtle bob
@@ -923,7 +985,8 @@ function faceCameraYaw(dt, strength=10){
   // Blend: makes "look at the camera" feel stronger when camera is orbiting
   const dir = dirPos.clone().lerp(dirView, 0.35).normalize();
 
-  const targetYaw = Math.atan2(dir.x, dir.z) + yawOffset;
+  // Face the camera direction. +PI because a Three.js Object3D faces -Z by default.
+  const targetYaw = Math.atan2(dir.x, dir.z) + Math.PI + yawOffset;
   root.rotation.y = lerpAngle(root.rotation.y, targetYaw, 1 - Math.exp(-dt * strength));
 }
 
@@ -985,15 +1048,14 @@ function lookAtCameraHead(dt){
 
 // Base pose (hands together, calm)
 const BASE = {
-  // Calm idle: hands gently together in front (no T-pose, no arm flapping)
-  // NOTE: values are tuned for the bundled base_female VRM (many exports start in a T-pose).
-  // These are *stronger* than before to ensure arms come down instead of staying horizontal.
-  rUpperArm: new THREE.Euler(0.15, -0.20, 1.10),
-  rLowerArm: new THREE.Euler(-1.05, 0.10, 0.18),
-  rHand: new THREE.Euler(0.05, -0.10, 0.10),
-  lUpperArm: new THREE.Euler(0.15, 0.20, -1.10),
-  lLowerArm: new THREE.Euler(-1.05, -0.10, -0.18),
-  lHand: new THREE.Euler(0.05, 0.10, -0.10),
+  // Calm idle base.
+  // IMPORTANT: keep offsets conservative so we don't accidentally push arms up (different VRM rest poses vary a lot).
+  rUpperArm: new THREE.Euler(0.05, -0.08, 0.10),
+  rLowerArm: new THREE.Euler(-0.35, 0.05, 0.10),
+  rHand: new THREE.Euler(0.00, -0.05, 0.00),
+  lUpperArm: new THREE.Euler(0.05, 0.08, -0.10),
+  lLowerArm: new THREE.Euler(-0.35, -0.05, -0.10),
+  lHand: new THREE.Euler(0.00, 0.05, 0.00),
   chest: new THREE.Euler(0.00, 0.00, 0.00)
 };
 
@@ -1292,7 +1354,8 @@ function updateWander(dt){
     pos.x = THREE.MathUtils.clamp(pos.x, -2.05, 2.05);
     pos.z = THREE.MathUtils.clamp(pos.z, -2.05, 2.05);
 
-    const yaw = Math.atan2(dir.x, dir.z) + yawOffset;
+    // Face the movement direction. +PI because a Three.js Object3D faces -Z by default.
+    const yaw = Math.atan2(dir.x, dir.z) + Math.PI + yawOffset;
     root.rotation.y = lerpAngle(root.rotation.y, yaw, 1 - Math.exp(-dt * 4));
 
     // tiny step bob (subtle)
@@ -1592,6 +1655,11 @@ if (root){
     updateMouth(dt);
     // Apply VRM internal updates (springs, constraints, etc.) after posing
     if (vrm) vrm.update(dt);
+
+    // Final safety pass: if arms are ending up raised (common with mismatched animations), pull them down.
+    // Use the current gesture power to avoid fighting intentional gestures.
+    const gPow = Math.max(w.wave||0, w.happy||0, w.sad||0, w.angry||0, w.surprise||0, w.shy||0, w.think||0);
+    applyArmSafety(dt, gPow);
 
 
     renderer.render(scene, camera);
