@@ -189,7 +189,7 @@ const renderer = new THREE.WebGLRenderer({
 renderer.setClearColor(0x000000, 0);
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
-renderer.toneMappingExposure = 1.25;
+renderer.toneMappingExposure = isMobile() ? 1.02 : 1.08; // tuned to match VRoidHub-like preview (less dazzling)
 
 const scene = new THREE.Scene();
 scene.fog = new THREE.Fog(0xf6d9ff, 6, 22);
@@ -220,21 +220,21 @@ const composer = new EffectComposer(renderer);
 const renderPass = new RenderPass(scene, camera);
 composer.addPass(renderPass);
 
-const bloomStrength = isMobile() ? 0.55 : 0.85;
-const bloomRadius   = isMobile() ? 0.35 : 0.45;
-const bloomThreshold = 0.18;
+const bloomStrength = isMobile() ? 0.30 : 0.48; // softer bloom (avoid glare)
+const bloomRadius   = isMobile() ? 0.22 : 0.30;
+const bloomThreshold = 0.35; // higher threshold => fewer pixels bloom
 const bloomPass = new UnrealBloomPass(new THREE.Vector2(1, 1), bloomStrength, bloomRadius, bloomThreshold);
 composer.addPass(bloomPass);
 
 const colorPass = new ShaderPass(ColorCorrectionShader);
 colorPass.uniforms.powRGB.value.set(1.0, 1.0, 1.0);
-colorPass.uniforms.mulRGB.value.set(1.08, 1.06, 1.10);
-colorPass.uniforms.addRGB.value.set(0.02, 0.02, 0.03);
+colorPass.uniforms.mulRGB.value.set(1.03, 1.02, 1.04);
+colorPass.uniforms.addRGB.value.set(0.008, 0.008, 0.010);
 composer.addPass(colorPass);
 
 const vignettePass = new ShaderPass(VignetteShader);
 vignettePass.uniforms.offset.value = 1.0;
-vignettePass.uniforms.darkness.value = isMobile() ? 0.65 : 0.75;
+vignettePass.uniforms.darkness.value = isMobile() ? 0.60 : 0.70;
 composer.addPass(vignettePass);
 
 const fxaaPass = new ShaderPass(FXAAShader);
@@ -319,14 +319,14 @@ renderer.domElement.addEventListener('pointerup', (ev) => {
 });
 
 // Lights
-scene.add(new THREE.AmbientLight(0xffffff, 0.95));
-const key = new THREE.DirectionalLight(0xffffff, 1.45);
+scene.add(new THREE.AmbientLight(0xffffff, 0.65));
+const key = new THREE.DirectionalLight(0xffffff, 1.10);
 key.position.set(2.5, 4.0, 2.0);
 scene.add(key);
-const rim = new THREE.DirectionalLight(0xffe6f4, 0.55);
+const rim = new THREE.DirectionalLight(0xffe6f4, 0.35);
 rim.position.set(-2.5, 2.2, -2.8);
 scene.add(rim);
-const hemi = new THREE.HemisphereLight(0xdff4ff, 0xffe7f2, 0.55);
+const hemi = new THREE.HemisphereLight(0xdff4ff, 0xffe7f2, 0.45);
 scene.add(hemi);
 
 
