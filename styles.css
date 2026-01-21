@@ -154,3 +154,8 @@ body{
   #text{padding:8px 10px}
   #send{padding:8px 12px}
 }
+
+
+/* loading overlay fade */
+.overlay{ transition: opacity 0.45s ease; }
+.overlay.fadeout{ opacity:0; pointer-events:none; }

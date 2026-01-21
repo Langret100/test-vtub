@@ -1,6 +1,15 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
+import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
+import { ShaderPass } from 'three/examples/jsm/postprocessing/ShaderPass.js';
+import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
+import { FXAAShader } from 'three/examples/jsm/shaders/FXAAShader.js';
+import { VignetteShader } from 'three/examples/jsm/shaders/VignetteShader.js';
+import { ColorCorrectionShader } from 'three/examples/jsm/shaders/ColorCorrectionShader.js';
+
 import { VRMLoaderPlugin, VRMUtils, VRMHumanBoneName } from '@pixiv/three-vrm';
 import { VRMAnimationLoaderPlugin, createVRMAnimationClip } from '@pixiv/three-vrm-animation';
 
@@ -36,6 +45,15 @@ function setLoadingText(title, desc=''){
   if (t) t.textContent = title;
   if (d) d.textContent = desc;
 }
+
+function hideLoadingOverlay(){
+  if (!elLoading) return;
+  elLoading.classList.add('fadeout');
+  setTimeout(() => {
+    if (elLoading) elLoading.style.display = 'none';
+  }, 480);
+}
+
 
 // ---------------- Helpers ----------------
 const clamp01 = (x) => Math.max(0, Math.min(1, x));
@@ -171,10 +189,15 @@ const renderer = new THREE.WebGLRenderer({
 renderer.setClearColor(0x000000, 0);
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
-renderer.toneMappingExposure = 1.15;
+renderer.toneMappingExposure = 1.25;
 
 const scene = new THREE.Scene();
 scene.fog = new THREE.Fog(0xf6d9ff, 6, 22);
+
+// Eye gaze target (drives VRM lookAt)
+const gazeTarget = new THREE.Object3D();
+scene.add(gazeTarget);
+
 
 const camera = new THREE.PerspectiveCamera(35, 1, 0.1, 100);
 camera.position.set(0.0, 1.35, 3.15);
@@ -192,6 +215,35 @@ if (isMobile()){
   controls.enableZoom = true;
 }
 
+// --- Postprocessing (ENB-ish: bloom + color grading + vignette + FXAA) ---
+const composer = new EffectComposer(renderer);
+const renderPass = new RenderPass(scene, camera);
+composer.addPass(renderPass);
+
+const bloomStrength = isMobile() ? 0.55 : 0.85;
+const bloomRadius   = isMobile() ? 0.35 : 0.45;
+const bloomThreshold = 0.18;
+const bloomPass = new UnrealBloomPass(new THREE.Vector2(1, 1), bloomStrength, bloomRadius, bloomThreshold);
+composer.addPass(bloomPass);
+
+const colorPass = new ShaderPass(ColorCorrectionShader);
+colorPass.uniforms.powRGB.value.set(1.0, 1.0, 1.0);
+colorPass.uniforms.mulRGB.value.set(1.08, 1.06, 1.10);
+colorPass.uniforms.addRGB.value.set(0.02, 0.02, 0.03);
+composer.addPass(colorPass);
+
+const vignettePass = new ShaderPass(VignetteShader);
+vignettePass.uniforms.offset.value = 1.0;
+vignettePass.uniforms.darkness.value = isMobile() ? 0.65 : 0.75;
+composer.addPass(vignettePass);
+
+const fxaaPass = new ShaderPass(FXAAShader);
+composer.addPass(fxaaPass);
+
+const outputPass = new OutputPass();
+composer.addPass(outputPass);
+
+
 function onResize(){
   const w = canvas.clientWidth;
   const h = canvas.clientHeight;
@@ -200,6 +252,9 @@ function onResize(){
   const dprCap = isMobile() ? 0.95 : 2;
   renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, dprCap));
   renderer.setSize(w, h, false);
+  composer.setSize(w, h);
+  const pr = renderer.getPixelRatio();
+  fxaaPass.material.uniforms['resolution'].value.set(1 / (w * pr), 1 / (h * pr));
   camera.aspect = w / h;
   camera.updateProjectionMatrix();
 }
@@ -264,13 +319,16 @@ renderer.domElement.addEventListener('pointerup', (ev) => {
 });
 
 // Lights
-scene.add(new THREE.AmbientLight(0xffffff, 0.75));
-const key = new THREE.DirectionalLight(0xffffff, 1.25);
+scene.add(new THREE.AmbientLight(0xffffff, 0.95));
+const key = new THREE.DirectionalLight(0xffffff, 1.45);
 key.position.set(2.5, 4.0, 2.0);
 scene.add(key);
-const rim = new THREE.DirectionalLight(0xffe6f4, 0.45);
+const rim = new THREE.DirectionalLight(0xffe6f4, 0.55);
 rim.position.set(-2.5, 2.2, -2.8);
 scene.add(rim);
+const hemi = new THREE.HemisphereLight(0xdff4ff, 0xffe7f2, 0.55);
+scene.add(hemi);
+
 
 // ---------------- Classroom corner diorama (no roof, no front wall) ----------------
 const room = new THREE.Group();
@@ -636,6 +694,9 @@ async function loadAvatar(){
 
       // Calm base pose
       applyUpperBodyPose(0, { kind:'idle', wave:0, happy:0, sad:0, angry:0, talk:0 }, 1);
+      // Avoid initial T-pose flash: keep avatar hidden until motion pack is ready
+      if (vrm?.scene) vrm.scene.visible = false;
+
       resolve(true);
     }, onProgress, (err) => {
       clearTimeout(timeout);
@@ -1010,6 +1071,31 @@ function lookAtCameraHead(dt){
   // Backward compatibility: keep old name but call new system
   lookAtCameraUpperBody(dt, 1);
 }
+
+function updateEyeGaze(dt){
+  if (!vrm?.lookAt) return;
+  const root = actor();
+  if (!root) return;
+
+  // Neutral target: a point in front of the avatar
+  const rootPos = new THREE.Vector3();
+  root.getWorldPosition(rootPos);
+  const fwd = new THREE.Vector3(0, 0, -1).applyQuaternion(root.quaternion).normalize();
+  const neutral = rootPos.clone().addScaledVector(fwd, 3.0);
+  neutral.y = 1.35;
+
+  // Camera target
+  const cam = camera.position.clone();
+
+  // Blend weight: speaking -> strongest, otherwise gentle
+  const attentive = speaking || gesture.type !== 'none' || clock.elapsedTime < interaction.attentionUntil || interaction.mode !== 'wander';
+  const w = speaking ? 1.0 : (attentive ? 0.65 : 0.25);
+
+  const target = neutral.lerp(cam, w);
+  gazeTarget.position.lerp(target, 1 - Math.exp(-dt * 10));
+  vrm.lookAt.target = gazeTarget;
+}
+
 
 // Base pose (hands together, calm)
 const BASE = {
@@ -1560,36 +1646,44 @@ elText.addEventListener('keydown', (e) => {
   addBubble('VTuber', '예: "인사" / "기쁨" / "슬픔" / "화남" / "고마워" / "졸려"');
   if (!ttsEnabled) addBubble('시스템', '모바일은 소리 재생을 위해 오른쪽 위의 “음성 켜기”를 한 번 눌러줘!');
 
-  setLoadingText('아바타 로딩중…', '모바일은 처음 한 번만 조금 더 걸릴 수 있어요.');
+  setLoadingText('아바타/모션 로딩중…', '모션팩까지 준비되면 화면이 열려요.');
+
   // Android에서 VRM 로딩이 매우 오래 걸리거나 멈춘 것처럼 보이는 경우가 있어,
-  // 일정 시간 후에는 간편 아바타로 먼저 시작(로딩 화면 해제)하고,
-  // VRM이 나중에 로딩되면 자동으로 교체합니다.
-  const fallbackDelay = isMobile() ? 6000 : 18000;
+  // 일정 시간 후에는 간편 아바타를 먼저 준비해두되(배경에서),
+  // 모션팩까지 완료된 뒤에만 로딩 오버레이를 해제합니다.
+  const fallbackDelay = isMobile() ? 6500 : 20000;
   const fallbackTimer = setTimeout(() => {
     showFallbackIfNeeded();
-    if (elLoading) elLoading.style.display = 'none';
+    setLoadingText('아바타 로딩이 조금 길어지고 있어요…', '네트워크/기기 상황에 따라 더 걸릴 수 있어요.');
   }, fallbackDelay);
 
   const ok = await loadAvatar();
   clearTimeout(fallbackTimer);
-  if (elLoading) elLoading.style.display = 'none';
 
   if (!ok){
+    showFallbackIfNeeded();
+    hideLoadingOverlay();
+
     addBubble('시스템', '아바타 로딩에 실패했어요. 모바일이면: 데이터 절약 모드/저전력 모드 해제 후 다시 시도해보세요.');
     addBubble('시스템', '그래도 안 되면 다른 브라우저(Chrome/Edge/Safari)에서 열어봐줘!');
   } else {
+    setLoadingText('모션팩 로딩중…', '첫 시작만 조금 걸릴 수 있어요.');
+
+    await loadVRMAMotionPack();
+    if (vrmaLoaded){
+      // Default: always play Motion 7 as the idle loop (no walking).
+      playVRMA('motion7', { loop: 'repeat', fadeIn: 0.0 });
+      requestAttention(9999);
+    }
+
+    // Now it's safe to show the avatar (no T-pose flash).
+    if (vrm?.scene) vrm.scene.visible = true;
+    if (fallback && fallback.parent) fallback.parent.remove(fallback);
+
+    hideLoadingOverlay();
     addBubble('VTuber', '로딩 완료! 이제 얘기해보자~');
-
-    // Load VRMA motion pack after the avatar is visible (keeps first load snappy)
-    loadVRMAMotionPack().then(() => {
-      if (vrmaLoaded){
-        addBubble('시스템', '모션팩(VRMA) 로딩 완료! “모션1~7” 또는 “피스/총/스핀/스쿼트” 같은 말로 실행해볼 수 있어요.');
-
-        // Default: always play Motion 7 as the idle loop (no walking).
-        playVRMA('motion7', { loop: 'repeat', fadeIn: 0.25 });
-        requestAttention(9999);
-      }
-    });
+    addBubble('시스템', '캐릭터를 터치하면 모션이 랜덤으로 나와요!');
+    if (!ttsEnabled) addBubble('시스템', '모바일은 소리 재생을 위해 오른쪽 위의 “음성 켜기”를 한 번 눌러줘!');
   }
 
   function tick(){
@@ -1602,14 +1696,20 @@ elText.addEventListener('keydown', (e) => {
 
     // Interaction & gaze
     updateInteraction(dt);
+
+    // When speaking, make sure she really "looks at you" (head + eyes).
     const attentive = speaking || gesture.type !== 'none' || clock.elapsedTime < interaction.attentionUntil || interaction.mode !== 'wander';
-    if (attentive){
+    if (speaking){
+      faceCameraYaw(dt, 14);
+      lookAtCameraUpperBody(dt, 1.25);
+    } else if (attentive){
       faceCameraYaw(dt, 12);
       lookAtCameraUpperBody(dt, 1.0);
     } else {
       // soft casual gaze
       lookAtCameraUpperBody(dt, 0.25);
     }
+    updateEyeGaze(dt);
 
     const vrmaActive = isVRMAActive();
 
@@ -1634,7 +1734,7 @@ elText.addEventListener('keydown', (e) => {
     updateBlink(dt);
     updateMouth(dt);
 
-    renderer.render(scene, camera);
+    composer.render();
     requestAnimationFrame(tick);
   }
 
