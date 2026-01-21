@@ -14,7 +14,3 @@
 
 ---
 If you replace assets, please ensure their license is compatible with your distribution.
-
-
-## Animations (CC0)
-- Quaternius — Universal Animation Library (Standard). CC0. (See assets/motions/Quaternius_UAL_LICENSE.txt)

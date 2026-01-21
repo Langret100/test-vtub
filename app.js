@@ -1,7 +1,6 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
-import * as SkeletonUtils from 'three/examples/jsm/utils/SkeletonUtils.js';
 import { VRMLoaderPlugin, VRMUtils, VRMHumanBoneName } from '@pixiv/three-vrm';
 
 // ---------------- UI ----------------
@@ -39,6 +38,118 @@ function lerpAngle(a, b, t){
   const diff = THREE.MathUtils.euclideanModulo((b - a + Math.PI), twoPi) - Math.PI;
   return a + diff * t;
 }
+
+// --- Pose helpers (robust across VRM rest poses) ---
+function slerpToEulerRel(bone, baseQ, eulerOffset, alpha){
+  if (!bone) return;
+  const off = new THREE.Quaternion().setFromEuler(eulerOffset);
+  const tgt = (baseQ ? baseQ.clone().multiply(off) : off);
+  bone.quaternion.slerp(tgt, alpha);
+}
+
+function worldToRootLocal(root, v){
+  const inv = new THREE.Matrix4().copy(root.matrixWorld).invert();
+  return v.clone().applyMatrix4(inv);
+}
+
+// In three.js, Object3D forward is -Z. Use this to compute a yaw that faces an XZ direction.
+function yawFromDirXZ(dir){
+  return Math.atan2(-dir.x, -dir.z) + yawOffset;
+}
+
+// Pick yawOffset (0 or PI) so that yawFromDirXZ points the avatar toward the camera.
+function calibrateYawOffset(){
+  const root = actor();
+  if (!root) return;
+  root.updateMatrixWorld(true);
+  const p = new THREE.Vector3();
+  root.getWorldPosition(p);
+  const toCam = new THREE.Vector3().subVectors(camera.position, p);
+  toCam.y = 0;
+  if (toCam.lengthSq() < 1e-6) return;
+  toCam.normalize();
+
+  const baseYaw = Math.atan2(-toCam.x, -toCam.z);
+
+  const forwardForYaw = (yaw) => new THREE.Vector3(0,0,-1).applyAxisAngle(new THREE.Vector3(0,1,0), yaw);
+  const score = (off) => {
+    const yaw = baseYaw + off;
+    const f = forwardForYaw(yaw);
+    return f.dot(toCam);
+  };
+
+  const s0 = score(0);
+  const s1 = score(Math.PI);
+  yawOffset = (s1 > s0) ? Math.PI : 0;
+}
+
+// Calibrate a safe "arms down" offset once per model by sampling rotations.
+// This prevents T-pose / V-pose across different VRM exporters.
+function calibrateArmsDown(){
+  if (!vrm) return;
+
+  const root = actor();
+  if (!root) return;
+  root.updateMatrixWorld(true);
+
+  const targetR = new THREE.Vector3(0.40, -0.86, 0.10).normalize();
+  const targetL = new THREE.Vector3(-0.40, -0.86, 0.10).normalize();
+
+  const grid = {
+    x: [-2.0,-1.6,-1.2,-0.9,-0.6,-0.3,0.0,0.3],
+    y: [-0.9,-0.6,-0.3,0,0.3,0.6,0.9],
+    z: [-1.8,-1.2,-0.6,0,0.6,1.2,1.8]
+  };
+
+  function bestFor(side){
+    const ua = side === 'r' ? bones.rUpperArm : bones.lUpperArm;
+    const la = side === 'r' ? bones.rLowerArm : bones.lLowerArm;
+    const baseQ = side === 'r' ? basePose.rUpperArm : basePose.lUpperArm;
+    if (!ua || !la || !baseQ) return null;
+
+    const target = side === 'r' ? targetR : targetL;
+
+    const p0 = new THREE.Vector3();
+    const p1 = new THREE.Vector3();
+    const best = { score: 1e9, e: new THREE.Euler(0,0,0,'XYZ') };
+
+    for (const x of grid.x){
+      for (const y of grid.y){
+        for (const z of grid.z){
+          const off = new THREE.Quaternion().setFromEuler(new THREE.Euler(x,y,z,'XYZ'));
+          ua.quaternion.copy(baseQ).multiply(off);
+          vrm.scene.updateMatrixWorld(true);
+
+          ua.getWorldPosition(p0);
+          la.getWorldPosition(p1);
+
+          const a = worldToRootLocal(root, p0);
+          const b = worldToRootLocal(root, p1);
+          const d = b.sub(a).normalize();
+
+          const ang = 1 - d.dot(target); // 0 is best
+          const upPenalty = Math.max(0, d.y + 0.05) * 2.5; // strongly punish arms going up
+          const sidePenalty = Math.max(0, (side==='r' ? -d.x : d.x) + 0.02) * 1.2;
+          const s = ang + upPenalty + sidePenalty;
+
+          if (s < best.score){
+            best.score = s;
+            best.e = new THREE.Euler(x,y,z,'XYZ');
+          }
+        }
+      }
+    }
+
+    // restore
+    ua.quaternion.copy(baseQ);
+    vrm.scene.updateMatrixWorld(true);
+    return best.e;
+  }
+
+  armCalib.r = bestFor('r');
+  armCalib.l = bestFor('l');
+}
+
 
 function isMobile(){
   return matchMedia('(max-width: 879px)').matches || /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
@@ -318,15 +429,15 @@ function buildRoom(){
 
   // Chair
   const seat = new THREE.Mesh(new THREE.BoxGeometry(0.55, 0.06, 0.55), new THREE.MeshStandardMaterial({ color: 0x6d7f97, roughness: 0.9 }));
-  seat.position.set(0.75, 0.45, -1.05);
+  seat.position.set(0.35, 0.45, -1.25);
   room.add(seat);
   const back = new THREE.Mesh(new THREE.BoxGeometry(0.55, 0.5, 0.06), new THREE.MeshStandardMaterial({ color: 0x6d7f97, roughness: 0.9 }));
-  back.position.set(0.75, 0.74, -1.3);
+  back.position.set(0.35, 0.74, -1.5);
   room.add(back);
   const chairLegGeo = new THREE.BoxGeometry(0.05, 0.45, 0.05);
   [[-0.22,-0.22],[0.22,-0.22],[-0.22,0.22],[0.22,0.22]].forEach(([x,z])=>{
     const leg = new THREE.Mesh(chairLegGeo, legMat);
-    leg.position.set(0.75 + x, 0.225, -1.05 + z);
+    leg.position.set(0.35 + x, 0.225, -1.25 + z);
     room.add(leg);
   });
 
@@ -393,123 +504,9 @@ let avatarRoot = null;
 let bones = {};
 let fallback = null;
 let baseLook = { head: null, neck: null, chest: null };
+let basePose = {}; // local rest rotations for animated bones
+let armCalib = { r: null, l: null }; // calibrated upper-arm offsets
 let yawOffset = 0; // auto-calibrated so the avatar doesn't "walk backwards"
-
-// ---------------- Motion (CC0) ----------------
-// Quaternius Universal Animation Library (Standard) - CC0
-let motionSource = null;
-let motionClips = [];
-let motionMixer = null;
-let motionActions = null;
-let motionWalkBlend = 0;
-let motionReady = false;
-
-// Enable request caching for assets (helps repeat loads / mobile)
-THREE.Cache.enabled = true;
-
-// Load motion library in parallel with everything else
-const motionLoader = new GLTFLoader();
-const motionPromise = motionLoader
-  .loadAsync('assets/motions/ual_standard.glb')
-  .then((gltf) => {
-    motionSource = gltf.scene;
-    motionClips = gltf.animations || [];
-    return true;
-  })
-  .catch((e) => {
-    console.warn('Motion library load failed', e);
-    return false;
-  });
-
-function buildRetargetNameMap(){
-  if (!vrm) return {};
-  const h = vrm.humanoid;
-  const get = (name) => (h.getNormalizedBoneNode?.(name) || h.getRawBoneNode?.(name) || null);
-
-  const map = {};
-  const set = (targetNode, sourceName) => {
-    if (targetNode && targetNode.name) map[targetNode.name] = sourceName;
-  };
-
-  set(get(VRMHumanBoneName.Hips), 'DEF-hips');
-  set(get(VRMHumanBoneName.Spine), 'DEF-spine.001');
-  set(get(VRMHumanBoneName.Chest), 'DEF-spine.003');
-  // optional upper chest - map to spine.003 as well if present
-  set(get(VRMHumanBoneName.UpperChest), 'DEF-spine.003');
-  set(get(VRMHumanBoneName.Neck), 'DEF-neck');
-  set(get(VRMHumanBoneName.Head), 'DEF-head');
-
-  set(get(VRMHumanBoneName.LeftUpperArm), 'DEF-upper_arm.L');
-  set(get(VRMHumanBoneName.LeftLowerArm), 'DEF-forearm.L');
-  set(get(VRMHumanBoneName.LeftHand), 'DEF-hand.L');
-
-  set(get(VRMHumanBoneName.RightUpperArm), 'DEF-upper_arm.R');
-  set(get(VRMHumanBoneName.RightLowerArm), 'DEF-forearm.R');
-  set(get(VRMHumanBoneName.RightHand), 'DEF-hand.R');
-
-  set(get(VRMHumanBoneName.LeftUpperLeg), 'DEF-thigh.L');
-  set(get(VRMHumanBoneName.LeftLowerLeg), 'DEF-shin.L');
-  set(get(VRMHumanBoneName.LeftFoot), 'DEF-foot.L');
-  set(get(VRMHumanBoneName.LeftToes), 'DEF-toe.L');
-
-  set(get(VRMHumanBoneName.RightUpperLeg), 'DEF-thigh.R');
-  set(get(VRMHumanBoneName.RightLowerLeg), 'DEF-shin.R');
-  set(get(VRMHumanBoneName.RightFoot), 'DEF-foot.R');
-  set(get(VRMHumanBoneName.RightToes), 'DEF-toe.R');
-
-  return map;
-}
-
-async function initRetargetMotions(){
-  if (motionReady || !vrm || !avatarRoot) return;
-  await motionPromise;
-
-  if (!motionSource || !motionClips || motionClips.length === 0) return;
-
-  const walkSrc =
-    motionClips.find((c) => c.name === 'Walk_Formal_Loop') ||
-    motionClips.find((c) => c.name === 'Walk_Loop');
-
-  const idleSrc =
-    motionClips.find((c) => c.name === 'Idle_Loop') ||
-    motionClips.find((c) => c.name === 'Idle_Talking_Loop');
-
-  if (!walkSrc || !idleSrc){
-    console.warn('No walk/idle animations found in motion library');
-    return;
-  }
-
-  const opts = { names: buildRetargetNameMap(), fps: 30, useFirstFramePosition: false };
-
-  // Ensure matrices are up-to-date for retargeting
-  motionSource.updateMatrixWorld(true);
-  avatarRoot.updateMatrixWorld(true);
-
-  let walkClip, idleClip;
-  try{
-    walkClip = SkeletonUtils.retargetClip(avatarRoot, motionSource, walkSrc, opts);
-    idleClip = SkeletonUtils.retargetClip(avatarRoot, motionSource, idleSrc, opts);
-  }catch(e){
-    console.warn('Retarget failed, falling back to procedural pose', e);
-    return;
-  }
-
-  walkClip.name = 'Walk';
-  idleClip.name = 'Idle';
-
-  motionMixer = new THREE.AnimationMixer(avatarRoot);
-  const idle = motionMixer.clipAction(idleClip);
-  const walk = motionMixer.clipAction(walkClip);
-
-  idle.play();
-  walk.play();
-  walk.enabled = true;
-  walk.setEffectiveWeight(0);
-
-  motionActions = { idle, walk };
-  motionReady = true;
-}
-
 
 function toStandardMaterials(obj){
   obj.traverse((n) => {
@@ -617,23 +614,8 @@ async function loadAvatar(){
       avatarRoot.position.set(0.2, 0, -0.25);
       avatarRoot.rotation.y = Math.PI * 0.15;
       scene.add(avatarRoot);
-
-      // Calibrate model forward direction.
-      // Some VRM models face -Z in their local space, which makes movement look like walking backwards.
-      // We compare +Z vs -Z against the camera direction and pick the one that best faces the camera.
-      try{
-        const q = new THREE.Quaternion();
-        avatarRoot.getWorldQuaternion(q);
-        const fwd = new THREE.Vector3(0,0,1).applyQuaternion(q);
-        const toCam = new THREE.Vector3().subVectors(camera.position, avatarRoot.position);
-        toCam.y = 0;
-        if (toCam.lengthSq() > 1e-6) toCam.normalize();
-        const dotPlus = fwd.dot(toCam);
-        const dotMinus = fwd.clone().multiplyScalar(-1).dot(toCam);
-        yawOffset = (dotMinus > dotPlus) ? Math.PI : 0;
-      }catch{
-        yawOffset = 0;
-      }
+      // Calibrate yaw offset so the avatar faces the camera and doesn't "walk backwards".
+      yawOffset = 0; // will be auto-calibrated after matrices are ready
 
       // If we were using a lightweight fallback on mobile, swap to the real avatar now
       if (fallback){
@@ -672,19 +654,25 @@ async function loadAvatar(){
 
       detectExpressions();
 
-      // Cache base local rotations for look-at offsets
+      // Cache base local rotations (rest pose). We'll apply all animation as offsets from these.
+      basePose = {};
+      for (const [k,b] of Object.entries(bones)){
+        if (b?.quaternion) basePose[k] = b.quaternion.clone();
+      }
+
+      // Look-at uses these bases too
       baseLook = {
-        head: bones.head?.quaternion?.clone?.() || null,
-        neck: bones.neck?.quaternion?.clone?.() || null,
-        chest: bones.chest?.quaternion?.clone?.() || null
+        head: basePose.head || bones.head?.quaternion?.clone?.() || null,
+        neck: basePose.neck || bones.neck?.quaternion?.clone?.() || null,
+        chest: basePose.chest || bones.chest?.quaternion?.clone?.() || null
       };
+
+      // Calibrate facing + safe arms-down offsets once per model
+      calibrateYawOffset();
+      calibrateArmsDown();
 
       // Calm base pose
       applyUpperBodyPose(0, { kind:'idle', wave:0, happy:0, sad:0, angry:0, talk:0 }, 1);
-
-      // Try to initialize CC0 walk/idle motions (retargeted) in the background
-      initRetargetMotions();
-
       resolve(true);
     }, onProgress, (err) => {
       clearTimeout(timeout);
@@ -832,7 +820,7 @@ function updateApproach(dt){
   pos.x = THREE.MathUtils.clamp(pos.x, -2.05, 2.05);
   pos.z = THREE.MathUtils.clamp(pos.z, -2.05, 2.05);
 
-  const yaw = Math.atan2(dir.x, dir.z) + yawOffset;
+  const yaw = yawFromDirXZ(dir);
   root.rotation.y = lerpAngle(root.rotation.y, yaw, 1 - Math.exp(-dt * 7));
 
   // subtle bob
@@ -893,7 +881,7 @@ function faceCameraYaw(dt, strength=10){
   // Blend: makes "look at the camera" feel stronger when camera is orbiting
   const dir = dirPos.clone().lerp(dirView, 0.35).normalize();
 
-  const targetYaw = Math.atan2(dir.x, dir.z) + yawOffset;
+  const targetYaw = yawFromDirXZ(dir);
   root.rotation.y = lerpAngle(root.rotation.y, targetYaw, 1 - Math.exp(-dt * strength));
 }
 
@@ -968,6 +956,7 @@ const BASE = {
 };
 
 function slerpToEuler(bone, euler, alpha){
+  // Absolute pose helper (kept for legacy). Prefer slerpToEulerRel() with basePose.
   if (!bone) return;
   const q = new THREE.Quaternion().setFromEuler(euler);
   bone.quaternion.slerp(q, alpha);
@@ -999,16 +988,17 @@ function applyUpperBodyPose(dt, state, alpha){
     0,
     0
   );
-  slerpToEuler(bones.chest, chestEuler, a);
+  slerpToEulerRel(bones.chest, basePose.chest, chestEuler, a);
 
   const sWalk = Math.sin(walkPhase);
   const swing = 0.0; // keep hands together even while walking
 
   // Arms: calm by default, small swing when walking, gestures override
+  const baseR = armCalib.r || BASE.rUpperArm;
   const rUA = new THREE.Euler(
-    BASE.rUpperArm.x - 0.08*happy + 0.05*sad + swing*sWalk,
-    BASE.rUpperArm.y,
-    BASE.rUpperArm.z + swing*0.6
+    baseR.x - 0.08*happy + 0.05*sad + swing*sWalk,
+    baseR.y,
+    baseR.z + swing*0.6
   );
   const rLA = new THREE.Euler(
     BASE.rLowerArm.x,
@@ -1040,18 +1030,19 @@ function applyUpperBodyPose(dt, state, alpha){
     rLA.set(-0.95, 0.18, 0.10);
   }
 
-  slerpToEuler(bones.rUpperArm, rUA, a);
-  slerpToEuler(bones.rLowerArm, rLA, a);
+  slerpToEulerRel(bones.rUpperArm, basePose.rUpperArm, rUA, a);
+  slerpToEulerRel(bones.rLowerArm, basePose.rLowerArm, rLA, a);
 
   if (bones.rHand){
     const wig = wave > 0 ? Math.sin(clock.elapsedTime * 10) * 0.35 * wave : 0;
-    slerpToEuler(bones.rHand, new THREE.Euler(0,0,wig), a * 0.7);
+    slerpToEulerRel(bones.rHand, basePose.rHand, new THREE.Euler(0,0,wig), a * 0.7);
   }
 
+  const baseL = armCalib.l || BASE.lUpperArm;
   const lUA = new THREE.Euler(
-    BASE.lUpperArm.x - 0.08*happy + 0.05*sad - swing*sWalk,
-    BASE.lUpperArm.y,
-    BASE.lUpperArm.z - swing*0.6
+    baseL.x - 0.08*happy + 0.05*sad - swing*sWalk,
+    baseL.y,
+    baseL.z - swing*0.6
   );
   const lLA = new THREE.Euler(BASE.lLowerArm.x, BASE.lLowerArm.y, BASE.lLowerArm.z);
 
@@ -1068,9 +1059,9 @@ function applyUpperBodyPose(dt, state, alpha){
     lUA.set(0.30, 0.15, -0.65);
     lLA.set(-0.85, -0.18, -0.10);
   }
-  slerpToEuler(bones.lUpperArm, lUA, a);
-  slerpToEuler(bones.lLowerArm, lLA, a);
-  slerpToEuler(bones.lHand, BASE.lHand, a);
+  slerpToEulerRel(bones.lUpperArm, basePose.lUpperArm, lUA, a);
+  slerpToEulerRel(bones.lLowerArm, basePose.lLowerArm, lLA, a);
+  slerpToEulerRel(bones.lHand, basePose.lHand, BASE.lHand, a);
 
   // Head nod add (keep small, head lookAt handles most)
   if (bones.neck && nod){
@@ -1262,7 +1253,7 @@ function updateWander(dt){
     pos.x = THREE.MathUtils.clamp(pos.x, -2.05, 2.05);
     pos.z = THREE.MathUtils.clamp(pos.z, -2.05, 2.05);
 
-    const yaw = Math.atan2(dir.x, dir.z) + yawOffset;
+    const yaw = yawFromDirXZ(dir);
     root.rotation.y = lerpAngle(root.rotation.y, yaw, 1 - Math.exp(-dt * 4));
 
     // tiny step bob (subtle)
@@ -1287,22 +1278,29 @@ function applyWalkCycle(dt){
   const knee = moving ? 0.55 * moveAmount : 0;
 
   // hips gentle sway
+  // feminine sway: subtle chest counter-roll + tiny bounce
+  if (bones.chest){
+    const sway = moving ? (-s * 0.040 * moveAmount) : 0;
+    const bounce = moving ? (Math.abs(c) * 0.010 * moveAmount) : 0;
+    slerpToEulerRel(bones.chest, basePose.chest, new THREE.Euler(bounce, 0, sway), a * 0.55);
+  }
+
   if (bones.hips){
-    const hipsQ = new THREE.Quaternion().setFromEuler(new THREE.Euler(0, 0, moving ? s * 0.03 : 0));
-    bones.hips.quaternion.slerp(hipsQ, a * 0.45);
+    const hipsOff = new THREE.Euler(0, 0, moving ? s * 0.10 * moveAmount : 0);
+    slerpToEulerRel(bones.hips, basePose.hips, hipsOff, a * 0.70);
   }
 
   // Right leg forward when sin positive
-  slerpToEuler(bones.rUpperLeg, new THREE.Euler( stride * s, 0, 0), a);
-  slerpToEuler(bones.lUpperLeg, new THREE.Euler(-stride * s, 0, 0), a);
+  slerpToEulerRel(bones.rUpperLeg, basePose.rUpperLeg, new THREE.Euler( stride * s, 0, 0), a);
+  slerpToEulerRel(bones.lUpperLeg, basePose.lUpperLeg, new THREE.Euler(-stride * s, 0, 0), a);
 
   // knees bend more when leg goes back (cos phase)
-  slerpToEuler(bones.rLowerLeg, new THREE.Euler( knee * Math.max(0, -c), 0, 0), a);
-  slerpToEuler(bones.lLowerLeg, new THREE.Euler( knee * Math.max(0, c), 0, 0), a);
+  slerpToEulerRel(bones.rLowerLeg, basePose.rLowerLeg, new THREE.Euler( knee * Math.max(0, -c), 0, 0), a);
+  slerpToEulerRel(bones.lLowerLeg, basePose.lLowerLeg, new THREE.Euler( knee * Math.max(0, c), 0, 0), a);
 
   // feet keep mostly flat
-  slerpToEuler(bones.rFoot, new THREE.Euler(-0.08 * stride * s, 0, 0), a);
-  slerpToEuler(bones.lFoot, new THREE.Euler( 0.08 * stride * s, 0, 0), a);
+  slerpToEulerRel(bones.rFoot, basePose.rFoot, new THREE.Euler(-0.08 * stride * s, 0, 0), a);
+  slerpToEulerRel(bones.lFoot, basePose.lFoot, new THREE.Euler( 0.08 * stride * s, 0, 0), a);
 
   // decay to idle when not moving
   if (!moving){
@@ -1463,8 +1461,6 @@ elText.addEventListener('keydown', (e) => {
 
     controls.update();
 
-    if (vrm) vrm.update(dt);
-
     // Interaction & gaze
     updateInteraction(dt);
     const attentive = speaking || gesture.type !== 'none' || clock.elapsedTime < interaction.attentionUntil || interaction.mode !== 'wander';
@@ -1476,34 +1472,13 @@ elText.addEventListener('keydown', (e) => {
       lookAtCameraUpperBody(dt, 0.25);
     }
 
-    // Gestures / pose (or retargeted CC0 motion)
-    if (motionReady && motionMixer && motionActions){
-      const targetWalk = (wander.active && !speaking) ? THREE.MathUtils.clamp(moveAmount, 0, 1) : 0;
-      motionWalkBlend = THREE.MathUtils.damp(motionWalkBlend, targetWalk, 6, dt);
-
-      motionActions.walk.setEffectiveWeight(motionWalkBlend);
-      motionActions.idle.setEffectiveWeight(1 - motionWalkBlend);
-
-      // Keep it as a true "walk" (not running): modest time scale
-      motionActions.walk.setEffectiveTimeScale(THREE.MathUtils.lerp(0.85, 1.05, motionWalkBlend));
-
-      motionMixer.update(dt);
-
-      // Re-apply look-at after animation evaluation so the head doesn't get overwritten
-      if (interaction.mode === 'focus' || speaking){
-        lookAtCameraUpperBody(dt, 1.0);
-      } else {
-        lookAtCameraUpperBody(dt, 0.25);
-      }
-    } else {
-      // Fallback: procedural posing
-      updateGesture(dt);
-      const w = gestureWeights();
-      const talk = speaking ? 1 : 0;
-      const walk = (wander.active && gesture.type === 'none' && !speaking) ? moveAmount : 0;
-      applyUpperBodyPose(dt, { kind:'idle', talk, walk, ...w }, 1 - Math.exp(-dt * 9));
-      applyWalkCycle(dt);
-    }
+    // Gestures / pose
+    updateGesture(dt);
+    const w = gestureWeights();
+    const talk = speaking ? 1 : 0;
+    const walk = (wander.active && gesture.type === 'none' && !speaking) ? moveAmount : 0;
+    applyUpperBodyPose(dt, { kind:'idle', talk, walk, ...w }, 1 - Math.exp(-dt * 9));
+    applyWalkCycle(dt);
 
     // Happy bounce (subtle)
     const root = actor();
@@ -1517,6 +1492,9 @@ elText.addEventListener('keydown', (e) => {
 
     updateBlink(dt);
     updateMouth(dt);
+
+    // Update VRM constraints/spring bones AFTER posing
+    if (vrm) vrm.update(dt);
 
     renderer.render(scene, camera);
     requestAnimationFrame(tick);
