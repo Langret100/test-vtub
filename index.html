@@ -6,24 +6,13 @@
   <title>VTuber Chat (Room)</title>
   <link rel="stylesheet" href="styles.css" />
 
-  <!-- perf: reduce connection setup cost for CDN ESM -->
-  <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
-  <link rel="modulepreload" href="app.js">
-  <link rel="preload" href="assets/avatar.vrm" as="fetch" crossorigin>
-
-  <!-- If you add VRMA files, the app will auto-detect and load them from:
-       assets/motions/idle.vrma
-       assets/motions/walk.vrma
-       (No preload here to avoid extra 404 requests when files are not present.) -->
-
   <!-- Pure static site (GitHub Pages OK): use CDN ESM via importmap -->
   <script type="importmap">
   {
     "imports": {
       "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
       "three/examples/jsm/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
-      "@pixiv/three-vrm": "https://cdn.jsdelivr.net/npm/@pixiv/three-vrm@3.4.5/lib/three-vrm.module.min.js",
-      "@pixiv/three-vrm-animation": "https://cdn.jsdelivr.net/npm/@pixiv/three-vrm-animation@3.4.4/lib/three-vrm-animation.module.min.js"
+      "@pixiv/three-vrm": "https://cdn.jsdelivr.net/npm/@pixiv/three-vrm@3.4.5/lib/three-vrm.module.min.js"
     }
   }
   </script>
