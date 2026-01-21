@@ -1,7 +1,17 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
+import { SkeletonUtils } from 'three/examples/jsm/utils/SkeletonUtils.js';
 import { VRMLoaderPlugin, VRMUtils, VRMHumanBoneName } from '@pixiv/three-vrm';
+
+// perf: enable three.js internal request cache for repeated loads
+THREE.Cache.enabled = true;
+
+// perf: cache static assets on repeat visits (same-origin only)
+if ('serviceWorker' in navigator){
+  // fire-and-forget
+  navigator.serviceWorker.register('./sw.js').catch(()=>{});
+}
 
 // ---------------- UI ----------------
 const elMessages = document.getElementById('messages');
@@ -302,7 +312,8 @@ function buildRoom(){
     new THREE.BoxGeometry(1.2, 0.08, 0.65),
     new THREE.MeshStandardMaterial({ color: 0xb98a5e, roughness: 0.85, metalness: 0.0 })
   );
-  deskTop.position.set(0.85, 0.78, -1.55);
+  // Push desk slightly back to avoid visual intersection with the chair
+  deskTop.position.set(0.85, 0.78, -1.68);
   room.add(deskTop);
   const legMat = new THREE.MeshStandardMaterial({ color: 0x8a96a8, roughness: 0.9, metalness: 0.0 });
   const legGeo = new THREE.BoxGeometry(0.06, 0.78, 0.06);
@@ -311,21 +322,23 @@ function buildRoom(){
   ];
   legs.forEach(([x,z])=>{
     const leg = new THREE.Mesh(legGeo, legMat);
-    leg.position.set(0.85 + x*0.9, 0.39, -1.55 + z*0.9);
+    leg.position.set(0.85 + x*0.9, 0.39, -1.68 + z*0.9);
     room.add(leg);
   });
 
   // Chair
   const seat = new THREE.Mesh(new THREE.BoxGeometry(0.55, 0.06, 0.55), new THREE.MeshStandardMaterial({ color: 0x6d7f97, roughness: 0.9 }));
-  seat.position.set(0.35, 0.45, -1.25);
+  // Align under the desk and pull it slightly forward so it doesn't intersect the desk volume.
+  // Pull the chair a bit forward so it clearly clears the desk volume
+  seat.position.set(0.85, 0.45, -0.78);
   room.add(seat);
   const back = new THREE.Mesh(new THREE.BoxGeometry(0.55, 0.5, 0.06), new THREE.MeshStandardMaterial({ color: 0x6d7f97, roughness: 0.9 }));
-  back.position.set(0.35, 0.74, -1.5);
+  back.position.set(0.85, 0.74, -1.05);
   room.add(back);
   const chairLegGeo = new THREE.BoxGeometry(0.05, 0.45, 0.05);
   [[-0.22,-0.22],[0.22,-0.22],[-0.22,0.22],[0.22,0.22]].forEach(([x,z])=>{
     const leg = new THREE.Mesh(chairLegGeo, legMat);
-    leg.position.set(0.35 + x, 0.225, -1.25 + z);
+    leg.position.set(0.85 + x, 0.225, -0.78 + z);
     room.add(leg);
   });
 
@@ -334,7 +347,7 @@ function buildRoom(){
     new THREE.SphereGeometry(0.085, 20, 20),
     new THREE.MeshStandardMaterial({ color: 0xfff2bf, emissive: 0xffe3a0, emissiveIntensity: 0.55 })
   );
-  lamp.position.set(0.55, 1.02, -1.65);
+  lamp.position.set(0.55, 1.02, -1.78);
   room.add(lamp);
 
   // Bookshelf (low poly)
@@ -393,6 +406,213 @@ let bones = {};
 let fallback = null;
 let baseLook = { head: null, neck: null, chest: null };
 let yawOffset = 0; // auto-calibrated so the avatar doesn't "walk backwards"
+
+// ---------------- VRMA (downloaded motion) ----------------
+// Place your downloaded VRMA files here (same filenames) to override the procedural motion:
+//   assets/motions/idle.vrma
+//   assets/motions/walk.vrma
+const VRMA_URLS = {
+  idle: 'assets/motions/idle.vrma',
+  walk: 'assets/motions/walk.vrma'
+};
+
+// 기본 포함된 저작권 프리(CC0) 모션 라이브러리 (GLB)
+// - Quaternius "Universal Animation Library (Standard)" 기반
+// - 필요 애니메이션: Idle_Loop / Walk_Loop
+const CC0_MOTION_URL = 'assets/motions/quaternius_animlib.glb';
+
+const vrma = {
+  ready: false,
+  mixer: null,
+  actionIdle: null,
+  actionWalk: null,
+  // Weight control
+  walkWeight: 0,
+};
+
+async function tryInitVRMA(){
+  if (!vrm || vrma.ready) return;
+
+  // Only initialize if the user actually has VRMA files (avoid extra network cost)
+  const exists = async (url) => {
+    try{
+      // Some static hosts don't support HEAD reliably; fallback to a tiny ranged GET.
+      let r = await fetch(url, { method: 'HEAD', cache: 'force-cache' });
+      if (r.ok) return true;
+      if (r.status === 405 || r.status === 403){
+        r = await fetch(url, { method: 'GET', headers: { Range: 'bytes=0-0' }, cache: 'force-cache' });
+        return r.ok;
+      }
+      return false;
+    }catch{ return false; }
+  };
+
+  const [hasIdle, hasWalk] = await Promise.all([exists(VRMA_URLS.idle), exists(VRMA_URLS.walk)]);
+  // VRMA가 없으면, 기본 포함된 CC0 모션(GLB)을 적용한다.
+  if (!hasIdle && !hasWalk){
+    await tryInitCC0Motion();
+    return;
+  }
+
+  try{
+    const mod = await import('@pixiv/three-vrm-animation');
+    const { VRMAnimationLoaderPlugin, createVRMAnimationClip } = mod || {};
+    if (!VRMAnimationLoaderPlugin || !createVRMAnimationClip) return;
+
+    const vrmaLoader = new GLTFLoader();
+    vrmaLoader.register((parser) => new VRMAnimationLoaderPlugin(parser));
+
+    const loadFirstVrmAnimation = async (url) => {
+      const gltf = await vrmaLoader.loadAsync(url);
+      const arr = gltf?.userData?.vrmAnimations;
+      return Array.isArray(arr) ? (arr[0] || null) : null;
+    };
+
+    const [idleAnim, walkAnim] = await Promise.all([
+      hasIdle ? loadFirstVrmAnimation(VRMA_URLS.idle) : Promise.resolve(null),
+      hasWalk ? loadFirstVrmAnimation(VRMA_URLS.walk) : Promise.resolve(null)
+    ]);
+
+    if (!idleAnim && !walkAnim) return;
+
+    vrma.mixer = new THREE.AnimationMixer(vrm.scene);
+
+    if (idleAnim){
+      const clip = createVRMAnimationClip(idleAnim, vrm);
+      vrma.actionIdle = vrma.mixer.clipAction(clip);
+      vrma.actionIdle.play();
+    }
+
+    if (walkAnim){
+      const clip = createVRMAnimationClip(walkAnim, vrm);
+      vrma.actionWalk = vrma.mixer.clipAction(clip);
+      vrma.actionWalk.play();
+      // start with 0 weight until we actually move
+      vrma.actionWalk.setEffectiveWeight(0);
+    }
+
+    vrma.ready = true;
+    addBubble('시스템', '다운받아둔 VRMA 모션을 적용했어 ✅ (idle/walk)');
+  }catch(e){
+    console.warn('VRMA init failed', e);
+  }
+}
+
+// ---------------- CC0 motion fallback (GLB + retarget) ----------------
+// We ship a CC0 animation library and retarget it onto the VRM at runtime.
+
+// Source rig bone names (Quaternius/Godot GLB) -> VRM humanoid bone keys
+const QUATERNUS_BONE_MAP = {
+  'DEF-hips': 'hips',
+  'DEF-spine.001': 'spine',
+  'DEF-spine.002': 'chest',
+  'DEF-spine.003': 'upperChest',
+  'DEF-neck': 'neck',
+  'DEF-head': 'head',
+
+  'DEF-shoulder.L': 'leftShoulder',
+  'DEF-upper_arm.L': 'leftUpperArm',
+  'DEF-forearm.L': 'leftLowerArm',
+  'DEF-hand.L': 'leftHand',
+  'DEF-shoulder.R': 'rightShoulder',
+  'DEF-upper_arm.R': 'rightUpperArm',
+  'DEF-forearm.R': 'rightLowerArm',
+  'DEF-hand.R': 'rightHand',
+
+  'DEF-thigh.L': 'leftUpperLeg',
+  'DEF-shin.L': 'leftLowerLeg',
+  'DEF-foot.L': 'leftFoot',
+  'DEF-toe.L': 'leftToes',
+  'DEF-thigh.R': 'rightUpperLeg',
+  'DEF-shin.R': 'rightLowerLeg',
+  'DEF-foot.R': 'rightFoot',
+  'DEF-toe.R': 'rightToes'
+};
+
+function renameBonesByMap(root, map){
+  root.traverse((n) => {
+    if (!n?.name) return;
+    const renamed = map[n.name];
+    if (renamed) n.name = renamed;
+  });
+}
+
+function ensureVrmHumanoidBoneNames(){
+  const h = vrm?.humanoid;
+  if (!h) return;
+  // Rename normalized (preferred) bones to match VRMHumanBoneName strings,
+  // so SkeletonUtils can retarget by name.
+  const getBone = (name) => (h.getNormalizedBoneNode?.(name) || h.getRawBoneNode?.(name) || null);
+  const names = [
+    VRMHumanBoneName.Hips,
+    VRMHumanBoneName.Spine,
+    VRMHumanBoneName.Chest,
+    VRMHumanBoneName.UpperChest,
+    VRMHumanBoneName.Neck,
+    VRMHumanBoneName.Head,
+    VRMHumanBoneName.LeftShoulder,
+    VRMHumanBoneName.LeftUpperArm,
+    VRMHumanBoneName.LeftLowerArm,
+    VRMHumanBoneName.LeftHand,
+    VRMHumanBoneName.RightShoulder,
+    VRMHumanBoneName.RightUpperArm,
+    VRMHumanBoneName.RightLowerArm,
+    VRMHumanBoneName.RightHand,
+    VRMHumanBoneName.LeftUpperLeg,
+    VRMHumanBoneName.LeftLowerLeg,
+    VRMHumanBoneName.LeftFoot,
+    VRMHumanBoneName.LeftToes,
+    VRMHumanBoneName.RightUpperLeg,
+    VRMHumanBoneName.RightLowerLeg,
+    VRMHumanBoneName.RightFoot,
+    VRMHumanBoneName.RightToes
+  ];
+  names.filter(Boolean).forEach((bn) => {
+    const node = getBone(bn);
+    if (node) node.name = bn;
+  });
+}
+
+async function tryInitCC0Motion(){
+  if (!vrm || vrma.ready) return;
+  try{
+    ensureVrmHumanoidBoneNames();
+
+    const loader = new GLTFLoader();
+    const gltf = await loader.loadAsync(CC0_MOTION_URL);
+    const srcRoot = gltf?.scene;
+    const anims = gltf?.animations || [];
+    if (!srcRoot || !anims.length) return;
+
+    // Normalize source bone names to VRM humanoid keys.
+    renameBonesByMap(srcRoot, QUATERNUS_BONE_MAP);
+
+    const findClip = (needle) => anims.find(a => (a?.name || '').toLowerCase() === needle.toLowerCase()) || null;
+    const idleClip = findClip('Idle_Loop') || anims[0] || null;
+    const walkClip = findClip('Walk_Loop') || findClip('Jog_Fwd_Loop') || null;
+    if (!idleClip && !walkClip) return;
+
+    // Retarget onto the VRM skeleton.
+    vrma.mixer = new THREE.AnimationMixer(vrm.scene);
+    if (idleClip){
+      const r = SkeletonUtils.retargetClip(vrm.scene, srcRoot, idleClip, { useFirstFramePosition: true });
+      vrma.actionIdle = vrma.mixer.clipAction(r);
+      vrma.actionIdle.play();
+    }
+    if (walkClip){
+      const r = SkeletonUtils.retargetClip(vrm.scene, srcRoot, walkClip, { useFirstFramePosition: true });
+      vrma.actionWalk = vrma.mixer.clipAction(r);
+      vrma.actionWalk.play();
+      vrma.actionWalk.setEffectiveWeight(0);
+    }
+
+    vrma.ready = true;
+    addBubble('시스템', '저작권 프리(CC0) 모션을 적용했어 ✅ (Idle_Loop / Walk_Loop)');
+  }catch(e){
+    console.warn('CC0 motion init failed', e);
+  }
+}
+// This avoids bundling third-party VRMA files with restrictive redistribution terms.
 
 function toStandardMaterials(obj){
   obj.traverse((n) => {
@@ -483,7 +703,7 @@ async function loadAvatar(){
       setLoadingText('아바타 로딩중…', `${p}%`);
     };
 
-    vrmLoader.load('assets/avatar.vrm', (gltf) => {
+    vrmLoader.load('assets/avatar.vrm', async (gltf) => {
       clearTimeout(timeout);
       const loaded = gltf.userData.vrm;
       if (!loaded){
@@ -564,6 +784,11 @@ async function loadAvatar(){
 
       // Calm base pose
       applyUpperBodyPose(0, { kind:'idle', wave:0, happy:0, sad:0, angry:0, talk:0 }, 1);
+
+      // If user already downloaded VRMA motions and put them in /assets/motions, use them.
+      // (Falls back to procedural if the files are missing.)
+      // Kick off VRMA init without blocking first paint (improves perceived load time).
+      tryInitVRMA();
       resolve(true);
     }, onProgress, (err) => {
       clearTimeout(timeout);
@@ -1342,10 +1567,23 @@ elText.addEventListener('keydown', (e) => {
 
     controls.update();
 
-    if (vrm) vrm.update(dt);
-
-    // Interaction & gaze
+    // Interaction & navigation
     updateInteraction(dt);
+
+    // Base motion (VRMA if present)
+    // We update the mixer BEFORE applying any procedural overlays, then call vrm.update at the end
+    // so constraints & spring bones get the final pose for this frame.
+    if (vrm && vrma.ready && vrma.mixer){
+      const overlay = speaking || gesture.type !== 'none';
+      const moving = (wander.active && interaction.mode === 'wander' && !overlay) ? moveAmount : 0;
+      const w = clamp01(moving);
+      vrma.walkWeight = w;
+      if (vrma.actionWalk) vrma.actionWalk.setEffectiveWeight(w);
+      if (vrma.actionIdle) vrma.actionIdle.setEffectiveWeight(1 - w);
+      vrma.mixer.update(dt);
+    }
+
+    // Gaze
     const attentive = speaking || gesture.type !== 'none' || clock.elapsedTime < interaction.attentionUntil || interaction.mode !== 'wander';
     if (attentive){
       faceCameraYaw(dt, 12);
@@ -1360,8 +1598,11 @@ elText.addEventListener('keydown', (e) => {
     const w = gestureWeights();
     const talk = speaking ? 1 : 0;
     const walk = (wander.active && gesture.type === 'none' && !speaking) ? moveAmount : 0;
-    applyUpperBodyPose(dt, { kind:'idle', talk, walk, ...w }, 1 - Math.exp(-dt * 9));
-    applyWalkCycle(dt);
+    const useProceduralPose = (!vrma.ready) || speaking || gesture.type !== 'none';
+    if (useProceduralPose){
+      applyUpperBodyPose(dt, { kind:'idle', talk, walk, ...w }, 1 - Math.exp(-dt * 9));
+      applyWalkCycle(dt);
+    }
 
     // Happy bounce (subtle)
     const root = actor();
@@ -1375,6 +1616,8 @@ elText.addEventListener('keydown', (e) => {
 
     updateBlink(dt);
     updateMouth(dt);
+
+    if (vrm) vrm.update(dt);
 
     renderer.render(scene, camera);
     requestAnimationFrame(tick);
