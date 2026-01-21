@@ -15,7 +15,6 @@
 ---
 If you replace assets, please ensure their license is compatible with your distribution.
 
+
 ## Animations (CC0)
-- **Kenney – Mini Characters 1** (CC0)
-  - Used assets: `assets/motions/kenney_mini/character-female-a.glb` (contains idle/walk clips)
-  - License file included: `assets/motions/kenney_mini/License.txt`
+- Quaternius — Universal Animation Library (Standard). CC0. (See assets/motions/Quaternius_UAL_LICENSE.txt)
