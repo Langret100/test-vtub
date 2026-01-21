@@ -585,19 +585,22 @@ function tuneSkinHighlights(obj){
       phys.alphaTest = m.alphaTest || 0;
       phys.depthWrite = m.depthWrite;
 
-      // Tuning: gentle, not oily
+      // Tuning: slightly more "moist" (still natural; no bloom)
       phys.metalness = 0.0;
-      phys.roughness = 0.55;
-      phys.clearcoat = 0.10;
-      phys.clearcoatRoughness = 0.65;
-      phys.reflectivity = 0.20;
-      phys.envMapIntensity = 0.35;
+      phys.roughness = 0.45;          // a bit smoother
+      phys.clearcoat = 0.18;          // gentle top-layer gloss
+      phys.clearcoatRoughness = 0.55; // broader highlight, not sharp
+      phys.reflectivity = 0.24;
+      phys.envMapIntensity = 0.45;
 
       // Optional newer props (safe even if ignored)
       try{
-        if ('ior' in phys) phys.ior = 1.4;
-        if ('specularIntensity' in phys) phys.specularIntensity = 0.25;
+        if ('ior' in phys) phys.ior = 1.45;
+        if ('specularIntensity' in phys) phys.specularIntensity = 0.32;
         if ('specularColor' in phys) phys.specularColor.set(0xffffff);
+        if ('sheen' in phys) phys.sheen = 0.06;
+        if ('sheenRoughness' in phys) phys.sheenRoughness = 0.85;
+        if ('sheenColor' in phys) phys.sheenColor.set(0xffffff);
       }catch{}
 
       phys.needsUpdate = true;
